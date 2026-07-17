@@ -149,6 +149,10 @@ namespace vk
 		case driver_vendor::ARM_MALI:
 			// Needs more testing
 			break;
+		case driver_vendor::TURNIP:
+		case driver_vendor::QUALCOMM_ADRENO:
+			rsx_log.notice("Vulkan: Initializing for Qualcomm Adreno / Mesa Turnip driver.");
+			break;
 		default:
 			rsx_log.warning("Unsupported device: %s", gpu_name);
 		}

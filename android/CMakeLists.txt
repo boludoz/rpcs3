@@ -15,6 +15,7 @@ set(USE_ARCH "" CACHE STRING "Specify -march= value to build for (e.g. armv8-a, 
 if(USE_ARCH)
     add_compile_options(-march=${USE_ARCH})
 endif()
+add_compile_definitions(HAVE_SUPPORTED_CURVES=1)
 
 # ---------------------------------------------------------------------------
 # Prebuilt FFmpeg for Android.
@@ -99,6 +100,13 @@ add_dependencies(3rdparty_ffmpeg ffmpeg-unpack)
 # entirely when ANDROID is set - that part of "removing Qt" is already done
 # upstream, we only need to supply the Android entry point below.
 # ---------------------------------------------------------------------------
+# LLVM's GetHostTriple.cmake cannot infer a triple when cross-compiling from
+# a Windows host (its config.guess fallback needs a Unix shell), leaving
+# LLVM_HOST_TRIPLE empty and breaking the LLVM build at TargetParser/Host.cpp.
+# "Host" in LLVM terms is where the libraries will run: the Android device.
+# FORCE so a stale empty value cached by a previous failed configure is fixed.
+set(LLVM_HOST_TRIPLE "${CMAKE_SYSTEM_PROCESSOR}-none-linux-android${ANDROID_NATIVE_API_LEVEL}" CACHE STRING "Host on which LLVM binaries will run" FORCE)
+
 set(USE_DISCORD_RPC off)
 set(USE_SDL off)
 set(USE_FAUDIO off)
@@ -123,19 +131,35 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/.. rpcs3_core EXCLUDE_FROM_ALL)
 # ---------------------------------------------------------------------------
 # The Android JNI entry point library.
 # ---------------------------------------------------------------------------
+# rpcs3's Input/ sources are only compiled into the Qt frontend on desktop
+# (rpcs3qt/CMakeLists.txt), which Android skips - but rpcs3_emu depends on
+# some of their symbols (e.g. cellGem needs g_cfg_move from ps_move_config)
+# and the JNI layer drives pad_thread/virtual_pad_handler directly.
+set(RPCS3_SRC_DIR ${CMAKE_SOURCE_DIR}/../rpcs3)
+
 add_library(${CMAKE_PROJECT_NAME} SHARED
     src/rpcsx-android.cpp
-    thirdparty/dev/iso.cpp
-)
+    ${RPCS3_SRC_DIR}/rpcs3_version.cpp
 
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    thirdparty
+    ${RPCS3_SRC_DIR}/Input/ds3_pad_handler.cpp
+    ${RPCS3_SRC_DIR}/Input/ds4_pad_handler.cpp
+    ${RPCS3_SRC_DIR}/Input/dualsense_pad_handler.cpp
+    ${RPCS3_SRC_DIR}/Input/hid_pad_handler.cpp
+    ${RPCS3_SRC_DIR}/Input/pad_thread.cpp
+    ${RPCS3_SRC_DIR}/Input/product_info.cpp
+    ${RPCS3_SRC_DIR}/Input/ps_move_calibration.cpp
+    ${RPCS3_SRC_DIR}/Input/ps_move_config.cpp
+    ${RPCS3_SRC_DIR}/Input/ps_move_handler.cpp
+    ${RPCS3_SRC_DIR}/Input/ps_move_tracker.cpp
+    ${RPCS3_SRC_DIR}/Input/skateboard_pad_handler.cpp
+    ${RPCS3_SRC_DIR}/Input/virtual_pad_handler.cpp
 )
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
     rpcs3_emu
     3rdparty::hidapi
     3rdparty::libusb
+    3rdparty::fusion
     android
     log
 )

@@ -771,6 +771,9 @@ extern void ppu_register_range(u32 addr, u32 size)
 		return;
 	}
 
+	// static std::mutex s_ppu_register_mutex;
+	// std::lock_guard lock(s_ppu_register_mutex);
+
 	size = utils::align(size + addr % 0x10000, 0x10000);
 	addr &= -0x10000;
 

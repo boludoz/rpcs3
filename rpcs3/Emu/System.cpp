@@ -490,7 +490,9 @@ void Emulator::Init()
 
 	// Not all renderers are known at compile time, so set a provided default if possible
 	ensure(m_supported_renderers.contains(m_default_renderer));
+// #ifndef ANDROID
 	ensure(!(m_default_renderer == video_renderer::vulkan && m_default_graphics_adapter.empty()));
+// #endif
 	g_cfg.video.renderer.set(m_default_renderer);
 	g_cfg.video.vk.adapter.set(m_default_graphics_adapter);
 

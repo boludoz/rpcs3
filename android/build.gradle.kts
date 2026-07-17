@@ -111,11 +111,17 @@ androidComponents {
             group = "rpcsx"
             description = "Collects and renames the librpcsx-android.so built for $flavorArch"
 
-            dependsOn("externalNativeBuild${variantNameCap}")
-
-            from(layout.buildDirectory.dir("intermediates/cxx")) {
-                include("**/obj/arm64-v8a/librpcsx-android.so")
-                include("**/arm64-v8a/librpcsx-android.so")
+            if (variant.name.endsWith("Release", ignoreCase = true)) {
+                dependsOn("strip${variantNameCap}DebugSymbols")
+                from(layout.buildDirectory.dir("intermediates/stripped_native_libs/${variant.name}")) {
+                    include("**/librpcsx-android.so")
+                }
+            } else {
+                dependsOn("externalNativeBuild${variantNameCap}")
+                from(layout.buildDirectory.dir("intermediates/cxx")) {
+                    include("**/obj/arm64-v8a/librpcsx-android.so")
+                    include("**/arm64-v8a/librpcsx-android.so")
+                }
             }
             includeEmptyDirs = false
             eachFile {

@@ -23,7 +23,10 @@ namespace rpcs3::utils
 	{
 		const u32 max_threads = static_cast<u32>(g_cfg.core.llvm_threads);
 		const u32 hw_threads = ::utils::get_thread_count();
-		const u32 thread_count = max_threads > 0 ? std::min(max_threads, hw_threads) : hw_threads;
+		u32 thread_count = max_threads > 0 ? std::min(max_threads, hw_threads) : hw_threads;
+#if defined(ANDROID) || defined(__ANDROID__)
+		thread_count = std::min(thread_count, 1u);
+#endif
 		return thread_count;
 	}
 

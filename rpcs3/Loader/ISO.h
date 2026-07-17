@@ -7,6 +7,7 @@
 #include "Crypto/aes.h"
 
 bool is_iso_file(const std::string& path, u64* size = nullptr, bool* is_raw_device = nullptr);
+bool is_iso_file(fs::file& file, u64* size = nullptr);
 
 void load_iso(const std::string& path);
 void unload_iso();

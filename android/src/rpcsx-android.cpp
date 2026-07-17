@@ -1,3 +1,7 @@
+// rpcs3 headers are not self-contained: every TU in the tree includes
+// stdafx.h first (std includes + rpcs3's fmt namespace + [[noreturn]] decls).
+#include "stdafx.h"
+
 #include "Crypto/unpkg.h"
 #include "Crypto/unself.h"
 #include "Emu/Audio/Cubeb/CubebBackend.h"
@@ -30,23 +34,22 @@
 #include "Input/hid_pad_handler.h"
 #include "Input/pad_thread.h"
 #include "Input/virtual_pad_handler.h"
+#include "Loader/ISO.h"
 #include "Loader/PSF.h"
 #include "Loader/PUP.h"
 #include "Loader/TAR.h"
 #include "Emu/Cell/lv2/sys_sync.h"
-#include "dev/block_dev.hpp"
-#include "dev/iso.hpp"
 #include "hidapi_libusb.h"
 #include "libusb.h"
 #include "rpcs3_version.h"
 #include "Emu/Cell/Modules/cellMsgDialog.h"
 #include "Emu/Cell/Modules/cellSysutil.h"
-#include "util/File.h"
-#include "util/JIT.h"
+#include "Utilities/File.h"
+#include "Utilities/JIT.h"
 #include "util/asm.hpp"
-#include "util/StrFmt.h"
-#include "util/StrUtil.h"
-#include "util/Thread.h"
+#include "Utilities/StrFmt.h"
+#include "Utilities/StrUtil.h"
+#include "Utilities/Thread.h"
 #include "util/console.h"
 #include "util/fixed_typemap.hpp"
 #include "util/logs.hpp"
@@ -59,6 +62,7 @@
 #include "Emu/Cell/Modules/sceNpTrophy.h"
 
 #include <algorithm>
+#include <cctype>
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
@@ -108,8 +112,8 @@ LOG_CHANNEL(rpcsx_android, "ANDROID");
 struct LogListener : logs::listener {
   LogListener() { logs::listener::add(this); }
 
-  void log(u64 stamp, const logs::message &msg, const std::string &prefix,
-           const std::string &text) override {
+  void log(u64 stamp, const logs::message &msg, std::string_view prefix,
+           std::string_view text) override {
     int prio = 0;
     switch (static_cast<logs::level>(msg)) {
     case logs::level::always:
@@ -138,7 +142,7 @@ struct LogListener : logs::listener {
       break;
     }
 
-    __android_log_write(prio, "RPCS3", text.c_str());
+    __android_log_write(prio, "RPCS3", std::string(text).c_str());
   }
 } static g_androidLogListener;
 
@@ -202,8 +206,9 @@ struct GraphicsFrame : GSFrameBase {
 
   bool can_consume_frame() const override { return false; }
 
-  void present_frame(std::vector<u8> &data, u32 pitch, u32 width, u32 height,
+  void present_frame(std::vector<u8>&& data, u32 pitch, u32 width, u32 height,
                      bool is_bgra) const override {}
+  void update_title(double fps = 0.0) override {}
   void take_screenshot(std::vector<u8> &&sshot_data, u32 sshot_width,
                        u32 sshot_height, bool is_bgra) override {}
 };
@@ -310,10 +315,16 @@ static FileType getFileType(const fs::file &file) {
     return FileType::Rap;
   }
 
-  if (iso_dev::open(std::make_unique<file_view_block_dev>(file))) {
-    return FileType::Iso;
+  // Check ISO header directly on duplicated handle to avoid procfs SELinux restrictions
+  if (file.get_handle() >= 0) {
+    fs::file dupFile = fs::file::from_native_handle(dup(file.get_handle()));
+    if (is_iso_file(dupFile)) {
+      return FileType::Iso;
+    }
   }
 
+  rpcsx_android.notice("getFileType: not an ISO (fd=%d, size=%llu)", file.get_handle(),
+                       file.size());
   return FileType::Unknown;
 }
 
@@ -788,6 +799,27 @@ static std::string locateParamSfoPath(std::string_view root) {
   return {};
 }
 
+// If the game dir holds a .iso (installed by installIso), the game boots from
+// the image directly: Emu.BootGame() on an iso path mounts it on the fly.
+static std::string findIsoInDir(const std::string &dir) {
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (!entry.is_regular_file(ec)) {
+      continue;
+    }
+
+    auto ext = entry.path().extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    if (ext == ".iso") {
+      return entry.path().string();
+    }
+  }
+
+  return {};
+}
+
 static std::optional<GameInfo>
 fetchGameInfo(const psf::registry &psf,
               std::filesystem::path psfRootPath = {}) {
@@ -871,6 +903,13 @@ fetchGameInfo(const psf::registry &psf,
           name = psf::get_string(c00Sfo, "TITLE", name);
         }
       }
+    }
+  }
+
+  if (isDiscGame) {
+    // On-the-fly disc image: boot the .iso itself if present
+    if (auto isoPath = findIsoInDir(path); !isoPath.empty()) {
+      path = std::move(isoPath);
     }
   }
 
@@ -1253,7 +1292,7 @@ extern bool ppu_load_exec(const ppu_exec_object &, bool virtual_load,
 extern void spu_load_exec(const spu_exec_object &);
 extern void spu_load_rel_exec(const spu_rel_object &);
 extern void ppu_precompile(std::vector<std::string> &dir_queue,
-                           std::vector<ppu_module<lv2_obj> *> *loaded_prx);
+                           std::vector<ppu_module<lv2_obj> *> *loaded_modules, bool is_fast_compilation);
 extern bool ppu_initialize(const ppu_module<lv2_obj> &, bool check_only = false,
                            u64 file_size = 0);
 extern void ppu_finalize(const ppu_module<lv2_obj> &);
@@ -1337,7 +1376,7 @@ private:
 
     bool is_vsh = workload.path.ends_with("/vsh.self");
 
-    Emu.SetState(system_state::running);
+    Emu.SetTestMode();
 
     MessageDialog::pushPendingProgressId(workload.progressId);
 
@@ -1368,7 +1407,7 @@ private:
           rpcsx_android.warning("title id is %s",
                                 psf::get_string(psf, "TITLE_ID"));
 
-          Emu.SetTitleID(std::string(psf::get_string(psf, "TITLE_ID")));
+          // Title ID is set during BootGame/Load, no separate setter needed
         } else {
           rpcsx_android.warning("param.sfo not found");
         }
@@ -1415,11 +1454,11 @@ private:
       }
     }
 
-    ppu_precompile(dir_queue, mod_list.empty() ? nullptr : &mod_list);
+    ppu_precompile(dir_queue, mod_list.empty() ? nullptr : &mod_list, false);
 
     rpcsx_android.error("Finalization");
     g_fxo->reset();
-    Emu.SetState(system_state::stopped);
+    Emu.Kill(false);
 
     MessageDialog::popPendingProgressId(workload.progressId);
 
@@ -1592,39 +1631,39 @@ static bool initVirtualPad(const std::shared_ptr<Pad> &pad) {
             CELL_PAD_DEV_TYPE_STANDARD, CELL_PAD_PCLASS_TYPE_STANDARD,
             pclass_profile, 0, 0, 50);
 
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_UP);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_DOWN);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_LEFT);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_RIGHT);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_CROSS);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_SQUARE);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_CIRCLE);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_TRIANGLE);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_L1);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_L2);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_L3);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_R1);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_R2);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_R3);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_START);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_SELECT);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::vector<std::set<u32>>{},
                               CELL_PAD_CTRL_PS);
 
   pad->m_sticks[0] = AnalogStick(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X, {}, {});
@@ -1641,8 +1680,8 @@ static bool initVirtualPad(const std::shared_ptr<Pad> &pad) {
   pad->m_sensors[3] =
       AnalogSensor(CELL_PAD_BTN_OFFSET_SENSOR_G, 0, 0, 0, DEFAULT_MOTION_G);
 
-  pad->m_vibrateMotors[0] = VibrateMotor(true, 0);
-  pad->m_vibrateMotors[1] = VibrateMotor(false, 0);
+  pad->m_vibrate_motors[0] = VibrateMotor(true);
+  pad->m_vibrate_motors[1] = VibrateMotor(false);
 
   if (pad->m_player_id < static_cast<u32>(kMaxVirtualPads)) {
     std::lock_guard lock(g_virtual_pad_mutex);
@@ -1712,6 +1751,47 @@ extern "C" bool _rpcsx_multiPadData(int playerIndex, int digital1, int digital2,
 }
 
 extern "C" int _rpcsx_getMaxVirtualPads() { return kMaxVirtualPads; }
+
+// Name of the first Vulkan physical device, or empty if Vulkan is unusable.
+// Emu.Init() requires a non-empty adapter name whenever the default renderer
+// is Vulkan (System.cpp ensure), so this must run before it.
+static std::string firstVulkanAdapter() {
+  if (!vkCreateInstance || !vkEnumeratePhysicalDevices ||
+      !vkGetPhysicalDeviceProperties || !vkDestroyInstance) {
+    return {};
+  }
+
+  VkApplicationInfo app{};
+  app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  app.pApplicationName = "RPCSX";
+  app.apiVersion = VK_API_VERSION_1_0;
+
+  VkInstanceCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  info.pApplicationInfo = &app;
+
+  VkInstance instance = VK_NULL_HANDLE;
+  if (vkCreateInstance(&info, nullptr, &instance) != VK_SUCCESS || !instance) {
+    rpcsx_android.error("firstVulkanAdapter: vkCreateInstance failed");
+    return {};
+  }
+
+  std::string name;
+  u32 count = 0;
+  if (vkEnumeratePhysicalDevices(instance, &count, nullptr) == VK_SUCCESS &&
+      count != 0) {
+    std::vector<VkPhysicalDevice> devices(count);
+    if (vkEnumeratePhysicalDevices(instance, &count, devices.data()) ==
+        VK_SUCCESS) {
+      VkPhysicalDeviceProperties props{};
+      vkGetPhysicalDeviceProperties(devices[0], &props);
+      name = props.deviceName;
+    }
+  }
+
+  vkDestroyInstance(instance, nullptr);
+  return name;
+}
 
 extern "C" bool _rpcsx_initialize(std::string_view rootDir,
                                   std::string_view user) {
@@ -1807,10 +1887,32 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
   set_rlim(RLIMIT_STACK, 256 * 1024 * 1024);
   set_rlim(RLIMIT_AS, RLIM_INFINITY);
 
+  // Resolve the Vulkan entry points from the system libvulkan unless a
+  // custom driver was already injected via _rpcsx_setCustomDriver.
+  vk::ensure_dynamic_symbols();
+
   virtual_pad_handler::set_on_connect_cb(initVirtualPad);
   setupCallbacks();
   Emu.SetHasGui(false);
   Emu.SetUsr(std::string(user));
+
+  // fixup_settings() inside Emu.Init() validates the configured renderer
+  // against this set - empty in a non-Qt build unless we populate it - and
+  // otherwise force-resets it to the default renderer (Null when unset).
+  // The SaveSettings() below would then persist that reset, wiping whatever
+  // the user picked in the settings UI on every app start. A Vulkan default
+  // additionally requires a concrete adapter name (System.cpp ensure).
+  std::set<video_renderer> supportedRenderers{video_renderer::null};
+  if (std::string adapter = firstVulkanAdapter(); !adapter.empty()) {
+    rpcsx_android.notice("Default GPU: '%s'", adapter);
+    supportedRenderers.insert(video_renderer::vulkan);
+    Emu.SetDefaultRenderer(video_renderer::vulkan);
+    Emu.SetDefaultGraphicsAdapter(std::move(adapter));
+  } else {
+    rpcsx_android.error("No Vulkan device found, falling back to Null renderer");
+  }
+  Emu.SetSupportedRenderers(std::move(supportedRenderers));
+
   Emu.Init();
 
   static_assert(kMaxVirtualPads == 4);
@@ -1826,6 +1928,7 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
   g_cfg_input.save("", g_cfg_input_configs.default_config);
 
   g_cfg.core.llvm_cpu.from_string("oryon-1");
+  g_cfg.core.llvm_threads.from_string("1");
 
   Emulator::SaveSettings(g_cfg.to_string(), Emu.GetTitleID());
   return true;
@@ -1862,7 +1965,9 @@ extern "C" int _rpcsx_boot(std::string_view path_) {
     path.pop_back();
   }
 
-  return static_cast<int>(Emu.BootGame(path, "", false, cfg_mode::global));
+  int result = static_cast<int>(Emu.BootGame(path, "", false, cfg_mode::custom));
+  rpcsx_android.error("_rpcsx_boot: BootGame returned %d for path %s", result, path.c_str());
+  return result;
 }
 
 extern "C" int _rpcsx_getState() {
@@ -1956,7 +2061,7 @@ extern "C" bool _rpcsx_usbDeviceEvent(int fd, int vendorId, int productId,
       handler->Init();
 
       std::vector<std::string> devices;
-      for (const auto &device : handler->list_connected_devices()) {
+      for (const auto &device : handler->list_devices()) {
         devices.push_back(device.name);
       }
 
@@ -2315,137 +2420,119 @@ static bool installRap(JNIEnv *env, fs::file &&file, jlong progressId,
   return true;
 }
 
+// On-the-fly ISO support (Loader/ISO.h): nothing is extracted besides tiny
+// sidecar files for the game list UI. The .iso itself is copied once into the
+// games dir and booted directly - Emu.BootGame() mounts it via load_iso().
+// Layout: games/<TITLE_ID>/<TITLE_ID>.iso + PS3_GAME/{PARAM.SFO,ICON0.PNG,...}
 static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
-  auto optIso = iso_dev::open(std::make_unique<file_view_block_dev>(file));
   Progress progress(env, progressId);
 
-  if (!optIso) {
+  if (file.get_handle() < 0) {
+    progress.failure("Invalid file handle");
+    return false;
+  }
+
+  fs::file dupFile = fs::file::from_native_handle(dup(file.get_handle()));
+  if (!is_iso_file(dupFile)) {
+    rpcsx_android.error("installIso: is_iso_file failed");
     progress.failure("Failed to read ISO");
     return false;
   }
 
-  auto iso = std::move(*optIso);
-  auto sfo_raw_file = iso.open("PS3_GAME/PARAM.SFO", fs::read);
+  const std::string gamesDir = fs::get_config_dir() + "games/";
+  std::error_code ec;
+  std::filesystem::create_directories(gamesDir, ec);
 
-  if (!sfo_raw_file) {
-    progress.failure("Failed to locate PARAM.SFO in ISO");
-    return false;
+  const std::string tempIsoPath = gamesDir + "_temp_install.iso";
+  const u64 totalSize = file.size();
+  progress.report(0, totalSize);
+
+  {
+    fs::file dst(tempIsoPath, fs::create + fs::trunc + fs::write);
+    if (!dst) {
+      progress.failure("Failed to create temporary ISO file");
+      return false;
+    }
+
+    file.seek(0);
+    std::vector<u8> buffer(16u * 1024 * 1024);
+    u64 written = 0;
+
+    while (written < totalSize) {
+      const u64 block = file.read(buffer.data(), buffer.size());
+      if (!block || dst.write(buffer.data(), block) != block) {
+        break;
+      }
+      written += block;
+      progress.report(written, totalSize);
+    }
+
+    if (written != totalSize) {
+      dst.close();
+      fs::remove_file(tempIsoPath);
+      progress.failure("Failed to copy ISO (out of space?)");
+      return false;
+    }
   }
 
-  fs::file sfo_file;
-  sfo_file.reset(std::move(sfo_raw_file));
-
-  auto sfo = psf::load_object(sfo_file, "iso://PS3_GAME/PARAM.SFO");
-  auto title_id = psf::get_string(sfo, "TITLE_ID");
+  iso_archive archive(tempIsoPath);
+  const auto sfo = archive.open_psf("PS3_GAME/PARAM.SFO");
+  const auto title_id = psf::get_string(sfo, "TITLE_ID");
 
   if (title_id.empty()) {
+    fs::remove_file(tempIsoPath);
+    rpcsx_android.error(
+        "installIso: no TITLE_ID in PS3_GAME/PARAM.SFO (sfo entries: %zu)",
+        sfo.size());
     progress.failure("Failed to fetch TITLE_ID from PARAM.SFO in ISO");
     return false;
   }
 
-  if (auto gameInfo = fetchGameInfo(sfo)) {
-    sendGameInfo(env, progressId, {{*gameInfo}});
-  }
+  rpcsx_android.notice("installIso: installing '%s'", title_id);
 
-  std::filesystem::path destinationPath =
-      fs::get_config_dir() + "games/" + std::string(title_id);
-  std::size_t filesCount = 0;
+  const std::filesystem::path destinationPath = gamesDir + std::string(title_id);
+  std::filesystem::create_directories(destinationPath / "PS3_GAME", ec);
 
-  auto roots = [&] {
-    std::vector<std::filesystem::path> result;
-    std::vector<std::filesystem::path> workList;
-    workList.push_back({});
-    result.push_back({});
-
-    while (!workList.empty()) {
-      auto path = std::move(workList.back());
-      workList.pop_back();
-
-      fs::dir dir;
-      dir.reset(iso.open_dir(path));
-
-      for (auto &entry : dir) {
-        if (entry.name == "." || entry.name == "..") {
-          continue;
-        }
-        if (entry.name == "PS3_UPDATE" && path.empty()) {
-          continue;
-        }
-
-        if (entry.is_directory) {
-          result.push_back(path / entry.name);
-          workList.push_back(path / entry.name);
-        } else {
-          filesCount++;
-        }
-      }
+  for (const char *sidecar : {"PS3_GAME/PARAM.SFO", "PS3_GAME/ICON0.PNG",
+                              "PS3_GAME/ICON1.PAM"}) {
+    if (!archive.is_file(sidecar)) {
+      continue;
     }
 
-    return result;
-  }();
+    fs::file src;
+    src.reset(archive.open(sidecar));
 
-  progress.report(0, filesCount);
+    if (!src) {
+      continue;
+    }
 
-  std::size_t processedFiles = 0;
-  std::error_code ec;
-
-  for (auto &root : roots) {
-    auto rootDestPath = root.empty() ? destinationPath : destinationPath / root;
-
-    std::filesystem::create_directories(rootDestPath, ec);
-    if (ec) {
-      progress.failure(fmt::format("Failed to create dir %s: %s",
-                                   rootDestPath.string(), ec.message()));
+    if (!fs::write_file((destinationPath / sidecar).string(),
+                        fs::open_mode::create + fs::open_mode::trunc,
+                        src.to_vector<std::uint8_t>())) {
+      progress.failure(
+          fmt::format("Failed to write %s", (destinationPath / sidecar).string()));
       return false;
     }
-
-    fs::dir dir;
-    dir.reset(iso.open_dir(root));
-
-    for (auto &entry : dir) {
-      if (entry.name == "." || entry.name == "..") {
-        continue;
-      }
-
-      auto entryDestPath = rootDestPath / entry.name;
-
-      if (entry.is_directory) {
-        std::filesystem::create_directories(entryDestPath, ec);
-        if (ec) {
-          progress.failure(fmt::format("Failed to create dir %s: %s",
-                                       entryDestPath.string(), ec.message()));
-          return false;
-        }
-
-        continue;
-      }
-      auto raw_file = iso.open(root / entry.name, fs::read);
-
-      if (!raw_file) {
-        progress.failure(fmt::format("Failed to open file in ISO: %s",
-                                     (root / entry.name).string()));
-        return false;
-      }
-
-      fs::file file;
-      file.reset(std::move(raw_file));
-
-      if (!fs::write_file(entryDestPath,
-                          fs::open_mode::create + fs::open_mode::trunc,
-                          file.to_vector<std::uint8_t>())) {
-        progress.failure(fmt::format("Failed to write file: %s, dest %s",
-                                     entryDestPath.string(),
-                                     destinationPath.string()));
-        return false;
-      }
-
-      progress.report(processedFiles++, filesCount);
-    }
   }
 
-  collectGameInfo(env, -1, {destinationPath});
-  auto ebootPath = locateEbootPath(destinationPath.string());
-  g_compilationQueue.push(progress, std::move(ebootPath));
+  if (!std::filesystem::is_regular_file(destinationPath / "PS3_GAME/PARAM.SFO")) {
+    fs::remove_file(tempIsoPath);
+    progress.failure("Failed to extract PARAM.SFO from ISO");
+    return false;
+  }
+
+  const std::filesystem::path finalIsoPath =
+      destinationPath / (std::string(title_id) + ".iso");
+  
+  std::filesystem::rename(tempIsoPath, finalIsoPath, ec);
+  if (ec) {
+    std::filesystem::copy_file(tempIsoPath, finalIsoPath,
+                                std::filesystem::copy_options::overwrite_existing, ec);
+    fs::remove_file(tempIsoPath);
+  }
+
+  collectGameInfo(env, -1, {destinationPath.string()});
+  progress.success(totalSize);
   return true;
 }
 
@@ -2536,6 +2623,7 @@ extern "C" std::string _rpcsx_systemInfo() {
               fallback_cpu_detection());
 
   {
+    vk::ensure_dynamic_symbols();
     vk::instance device_enum_context;
     if (device_enum_context.create("RPCS3")) {
       device_enum_context.bind();
@@ -2543,9 +2631,8 @@ extern "C" std::string _rpcsx_systemInfo() {
           device_enum_context.enumerate_devices();
 
       for (const auto &gpu : gpus) {
-        fmt::append(result, "GPU: %s\n\nDriver: %s (v%s)\n\nVulkan: %s",
-                    gpu.get_name(), gpu.get_driver_name(),
-                    gpu.get_driver_version(), gpu.get_driver_vk_version());
+        fmt::append(result, "GPU: %s\n\nDriver: v%s\n\n",
+                    gpu.get_name(), gpu.get_driver_version());
       }
     }
   }
@@ -2605,6 +2692,167 @@ extern "C" std::string _rpcsx_getUser() { return Emu.GetUsr(); }
 // TODO: either add to_json()/from_json() to cfg::_base upstream (and vendor
 // nlohmann/json.hpp, e.g. from https://github.com/nlohmann/json single_include),
 // or reimplement this pair against cfg::_base::to_string()/from_string().
+// --- Settings JSON bridge --------------------------------------------------
+// rpcsx-ui-android consumes the JSON schema that the rpcsx fork's
+// cfg::to_json produced (per-leaf objects with "type"/"value"/"default" plus
+// "variants" for enums and "min"/"max" for integers). Vanilla rpcs3's config
+// tree only speaks YAML strings, so serialize it here.
+
+static void json_append_escaped(std::string &out, std::string_view s) {
+  out += '"';
+  for (char c : s) {
+    switch (c) {
+    case '"': out += "\\\""; break;
+    case '\\': out += "\\\\"; break;
+    case '\n': out += "\\n"; break;
+    case '\r': out += "\\r"; break;
+    case '\t': out += "\\t"; break;
+    default:
+      if (static_cast<unsigned char>(c) < 0x20) {
+        fmt::append(out, "\\u%04x", static_cast<unsigned char>(c));
+      } else {
+        out += c;
+      }
+    }
+  }
+  out += '"';
+}
+
+static void cfg_to_json(const cfg::_base *node, std::string &out) {
+  switch (node->get_type()) {
+  case cfg::type::node: {
+    out += '{';
+    bool first = true;
+    for (const auto &child : static_cast<const cfg::node *>(node)->get_nodes()) {
+      if (!first) {
+        out += ',';
+      }
+      first = false;
+      json_append_escaped(out, child->get_name());
+      out += ':';
+      cfg_to_json(child, out);
+    }
+    out += '}';
+    break;
+  }
+  case cfg::type::_bool:
+    out += "{\"type\":\"bool\",\"value\":";
+    out += node->to_string();
+    out += ",\"default\":";
+    out += node->def_to_string();
+    out += '}';
+    break;
+  case cfg::type::_enum: {
+    out += "{\"type\":\"enum\",\"value\":";
+    json_append_escaped(out, node->to_string());
+    out += ",\"default\":";
+    json_append_escaped(out, node->def_to_string());
+    out += ",\"variants\":[";
+    bool first = true;
+    for (const auto &variant : node->to_list()) {
+      if (!first) {
+        out += ',';
+      }
+      first = false;
+      json_append_escaped(out, variant);
+    }
+    out += "]}";
+    break;
+  }
+  case cfg::type::_int:
+  case cfg::type::uint:
+  case cfg::type::uint128:
+    out += node->get_type() == cfg::type::_int ? "{\"type\":\"int\""
+                                               : "{\"type\":\"uint\"";
+    out += ",\"value\":";
+    json_append_escaped(out, node->to_string());
+    out += ",\"default\":";
+    json_append_escaped(out, node->def_to_string());
+    out += ",\"min\":";
+    json_append_escaped(out, node->min_to_string());
+    out += ",\"max\":";
+    json_append_escaped(out, node->max_to_string());
+    out += '}';
+    break;
+  case cfg::type::string:
+    out += "{\"type\":\"string\",\"value\":";
+    json_append_escaped(out, node->to_string());
+    out += ",\"default\":";
+    json_append_escaped(out, node->def_to_string());
+    out += '}';
+    break;
+  case cfg::type::set: {
+    out += "{\"type\":\"set\",\"value\":[";
+    bool first = true;
+    for (const auto &item : node->to_list()) {
+      if (!first) {
+        out += ',';
+      }
+      first = false;
+      json_append_escaped(out, item);
+    }
+    out += "]}";
+    break;
+  }
+  default:
+    // map/node_map/log/device: not rendered by the settings UI
+    out += "{\"type\":\"unknown\"}";
+    break;
+  }
+}
+
+// The UI sends a single JSON scalar: `true`/`false`, a bare number, or a
+// quoted string ("Vulkan"). Convert it to the plain string form vanilla
+// cfg::from_string expects.
+static bool json_scalar_to_string(std::string_view json, std::string &out) {
+  while (!json.empty() && (json.front() == ' ' || json.front() == '\t')) {
+    json.remove_prefix(1);
+  }
+  while (!json.empty() && (json.back() == ' ' || json.back() == '\t')) {
+    json.remove_suffix(1);
+  }
+
+  if (json.empty()) {
+    return false;
+  }
+
+  if (json.front() == '"') {
+    if (json.size() < 2 || json.back() != '"') {
+      return false;
+    }
+
+    json.remove_prefix(1);
+    json.remove_suffix(1);
+
+    out.clear();
+    for (std::size_t i = 0; i < json.size(); ++i) {
+      if (json[i] != '\\') {
+        out += json[i];
+        continue;
+      }
+
+      if (++i >= json.size()) {
+        return false;
+      }
+
+      switch (json[i]) {
+      case '"': out += '"'; break;
+      case '\\': out += '\\'; break;
+      case '/': out += '/'; break;
+      case 'n': out += '\n'; break;
+      case 'r': out += '\r'; break;
+      case 't': out += '\t'; break;
+      default: return false; // \uXXXX etc. never appear in settings values
+      }
+    }
+    return true;
+  }
+
+  // bare scalar: true/false/number
+  out = std::string(json);
+  return true;
+}
+
 extern "C" std::string _rpcsx_settingsGet(std::string_view path) {
   auto root = find_cfg_node(&g_cfg, path);
 
@@ -2612,7 +2860,9 @@ extern "C" std::string _rpcsx_settingsGet(std::string_view path) {
     return {};
   }
 
-  return root->to_string();
+  std::string result;
+  cfg_to_json(root, result);
+  return result;
 }
 
 extern "C" bool _rpcsx_settingsSet(std::string_view path,
@@ -2624,9 +2874,16 @@ extern "C" bool _rpcsx_settingsSet(std::string_view path,
     return false;
   }
 
-  if (!root->from_string(std::string(valueString), !Emu.IsStopped())) {
+  std::string value;
+  if (!json_scalar_to_string(valueString, value)) {
+    rpcsx_android.error("settingsSet: node %s passed with invalid json '%s'",
+                        path, valueString);
+    return false;
+  }
+
+  if (!root->from_string(value, !Emu.IsStopped())) {
     rpcsx_android.error("settingsSet: node %s not accepts value '%s'", path,
-                        valueString);
+                        value);
     return false;
   }
 
@@ -2639,18 +2896,22 @@ extern "C" std::string _rpcsx_getVersion() {
 }
 
 extern "C" void *_rpcsx_setCustomDriver(void *driverHandle) {
-  auto prevLoader = vk::instance::g_vk_loader;
-  if (prevLoader != nullptr) {
-    vk::symbol_cache::cache_instance().clear();
-  }
+  // driverHandle comes from adrenotools_open_libvulkan() on the UI side;
+  // nullptr switches back to the system libvulkan. Returns the previous
+  // handle so the UI can dlclose it.
+  rpcsx_android.notice("setCustomDriver(%p)", driverHandle);
+  return vk::load_dynamic_symbols(driverHandle);
+}
 
-  vk::instance::g_vk_loader = driverHandle;
+// Dummy implementation to satisfy RtMidi linkage on Android
+extern "C" jint JNI_GetCreatedJavaVMs(JavaVM **vmBuf, jsize bufLen, jsize *nVMs) {
+  if (nVMs) *nVMs = 0;
+  return 0; // JNI_OK
+}
 
-  if (driverHandle != nullptr) {
-    vk::symbol_cache::cache_instance().initialize();
-  }
-
-  return prevLoader;
+// Dummy implementation to satisfy curl linkage on Android
+extern "C" int wolfSSL_CTX_set1_groups_list(void* ctx, const char* list) {
+  return 1; // 1 = success
 }
 
 #pragma GCC diagnostic pop

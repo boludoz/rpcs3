@@ -3,7 +3,12 @@
 #include "Utilities/Thread.h"
 #include "Utilities/mutex.h"
 
+#ifdef WITHOUT_OPENAL
+using ALCdevice = void;
+using ALCenum = int;
+#else
 #include "alc.h"
+#endif
 
 // Error Codes
 enum CellMicInError : u32

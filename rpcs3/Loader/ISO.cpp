@@ -54,7 +54,8 @@ static void* get_aligned_buf()
 	return s_aligned_buf.buf;
 }
 
-static bool is_iso_file(iso_file& file, u64* size = nullptr)
+template <typename T>
+static bool is_iso_file_impl(T& file, u64* size)
 {
 	if (!file || file.size() < 32768ULL + 6)
 	{
@@ -75,6 +76,16 @@ static bool is_iso_file(iso_file& file, u64* size = nullptr)
 	return ret;
 }
 
+bool is_iso_file(fs::file& file, u64* size)
+{
+	return is_iso_file_impl(file, size);
+}
+
+static bool is_iso_file(iso_file& file, u64* size = nullptr)
+{
+	return is_iso_file_impl(file, size);
+}
+
 bool is_iso_file(const std::string& path, u64* size, bool* is_raw_device)
 {
 	if (path.empty())
@@ -87,7 +98,11 @@ bool is_iso_file(const std::string& path, u64* size, bool* is_raw_device)
 	// "new_path" is updated with the raw device path in case "path" points to a BD drive
 	const bool raw_device = fs::get_optical_raw_device(path, &new_path);
 
+#if defined(ANDROID) || defined(__ANDROID__)
+	if (!raw_device && !fs::is_file(path) && !path.starts_with("/proc/self/fd/"))
+#else
 	if (!raw_device && !fs::is_file(path))
+#endif
 	{
 		return false;
 	}

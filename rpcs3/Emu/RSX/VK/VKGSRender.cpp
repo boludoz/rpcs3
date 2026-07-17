@@ -734,6 +734,12 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 			backend_config.supports_passthrough_dma = false;
 		}
 		break;
+	case vk::driver_vendor::TURNIP:
+	case vk::driver_vendor::QUALCOMM_ADRENO:
+	case vk::driver_vendor::ARM_MALI:
+		rsx_log.notice("Configuring optimizations for tile-based mobile GPU driver (Turnip/Adreno/Mali)");
+		backend_config.supports_passthrough_dma = false;
+		break;
 	default: break;
 	}
 
@@ -1264,6 +1270,10 @@ void VKGSRender::on_init_thread()
 			m_shaders_cache->load(&dlg);
 		}
 	}
+
+	// Persist the freshly-compiled startup pipeline set right away, so the driver cache
+	// survives even if the game later crashes before a clean teardown.
+	vk::flush_pipeline_cache(*m_device);
 }
 
 void VKGSRender::on_exit()
