@@ -2330,6 +2330,9 @@ static bool installEdat(JNIEnv *env, fs::file &&file, jlong progressId,
                         std::string_view rootPath = {}) {
   Progress progress(env, progressId);
 
+  // Java owns this fd; don't let fs::file's destructor close it (fdsan).
+  AtExit atExit{[&] { file.release_handle(); }};
+
   NPD_HEADER npdHeader;
   if (!file.read(npdHeader)) {
     progress.failure("Invalid EDAT file");
@@ -2388,6 +2391,9 @@ static bool installRap(JNIEnv *env, fs::file &&file, jlong progressId,
                        std::string_view rootPath) {
   Progress progress(env, progressId);
 
+  // Java owns this fd; don't let fs::file's destructor close it (fdsan).
+  AtExit atExit{[&] { file.release_handle(); }};
+
   auto ebootPath = locateEbootPath(rootPath);
 
   std::vector<std::uint8_t> bytes;
@@ -2435,30 +2441,15 @@ static bool installRap(JNIEnv *env, fs::file &&file, jlong progressId,
   return true;
 }
 
-// On-the-fly ISO support (Loader/ISO.h): nothing is extracted besides tiny
-// sidecar files for the game list UI. The .iso itself is copied once into the
-// games dir and booted directly - Emu.BootGame() mounts it via load_iso().
-// Layout: games/<TITLE_ID>/<TITLE_ID>.iso + PS3_GAME/{PARAM.SFO,ICON0.PNG,...}
-static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::string_view sourceUri) {
+// Shared body: given a constructed iso_archive, extract the sidecars the UI
+// needs to render the game entry, then register the GameInfo. Used by both
+// the SAF-fd install path and the folder-scan path.
+static bool registerIsoArchive(JNIEnv *env, jlong progressId,
+                               iso_archive &archive,
+                               std::string_view sourceUri, u64 totalSize) {
   Progress progress(env, progressId);
-
-  if (file.get_handle() < 0) {
-    progress.failure("Invalid file handle");
-    return false;
-  }
-
-  fs::file dupFile = fs::file::from_native_handle(dup(file.get_handle()));
-  if (!is_iso_file(dupFile)) {
-    rpcsx_android.error("installIso: is_iso_file failed");
-    progress.failure("Failed to read ISO");
-    return false;
-  }
-
-  const u64 totalSize = file.size();
   progress.report(0, totalSize);
 
-  std::string fdPath = fmt::format("/proc/self/fd/{}", file.get_handle());
-  iso_archive archive(fdPath);
   const auto sfo = archive.open_psf("PS3_GAME/PARAM.SFO");
   const auto title_id = psf::get_string(sfo, "TITLE_ID");
 
@@ -2476,7 +2467,8 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::stri
   std::error_code ec;
   std::filesystem::create_directories(gamesDir, ec);
 
-  const std::filesystem::path destinationPath = gamesDir + std::string(title_id);
+  const std::filesystem::path destinationPath =
+      gamesDir + std::string(title_id);
   std::filesystem::create_directories(destinationPath / "PS3_GAME", ec);
 
   for (const char *sidecar : {"PS3_GAME/PARAM.SFO", "PS3_GAME/ICON0.PNG",
@@ -2495,8 +2487,8 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::stri
     if (!fs::write_file((destinationPath / sidecar).string(),
                         fs::open_mode::create + fs::open_mode::trunc,
                         src.to_vector<std::uint8_t>())) {
-      progress.failure(
-          fmt::format("Failed to write %s", (destinationPath / sidecar).string()));
+      progress.failure(fmt::format("Failed to write %s",
+                                   (destinationPath / sidecar).string()));
       return false;
     }
   }
@@ -2513,6 +2505,270 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::stri
   }
 
   progress.success(totalSize);
+  return true;
+}
+
+// On-the-fly ISO support (Loader/ISO.h): nothing is extracted besides tiny
+// sidecar files for the game list UI (PARAM.SFO/ICON0.PNG/ICON1.PAM under
+// games/<TITLE_ID>/PS3_GAME/). The .iso itself is never copied; the game is
+// booted directly from its source (sourceUri) - Emu.BootGame() mounts it via
+// load_iso().
+static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::string_view sourceUri) {
+  Progress progress(env, progressId);
+
+  // The Java side owns this fd (ParcelFileDescriptor). Prevent our fs::file
+  // destructor from closing it - otherwise Kotlin's descriptor.close() double
+  // closes and fdsan aborts the process.
+  AtExit atExit{[&] { file.release_handle(); }};
+
+  if (file.get_handle() < 0) {
+    progress.failure("Invalid file handle");
+    return false;
+  }
+
+  const int srcFd = file.get_handle();
+
+  // Initial magic check on a dup'd handle - avoids procfs SELinux
+  // restrictions on SAF-backed fds.
+  {
+    fs::file dupFile = fs::file::from_native_handle(dup(srcFd));
+    if (!is_iso_file(dupFile)) {
+      rpcsx_android.error("installIso: is_iso_file failed");
+      progress.failure("Failed to read ISO");
+      return false;
+    }
+  }
+
+  const u64 totalSize = file.size();
+
+  // File-first construction: iso_archive re-opens the image on demand by
+  // dup'ing this fd, so it never touches /proc/self/fd/N (which SELinux
+  // blocks under Storage Access Framework).
+  iso_archive archive(
+      [srcFd] { return fs::file::from_native_handle(dup(srcFd)); },
+      fmt::format("saf-fd:%d", srcFd));
+
+  return registerIsoArchive(env, progressId, archive, sourceUri, totalSize);
+}
+
+// Register an ISO located on the local filesystem by real path. Used by the
+// "Add ISO directory" folder-scan flow so the game boots directly from the
+// user-chosen file (no sourceUri fallback, no copying).
+static bool registerIsoByPath(JNIEnv *env, jlong progressId,
+                              const std::string &isoPath) {
+  if (!fs::is_file(isoPath) || !is_iso_file(isoPath)) {
+    return false;
+  }
+
+  iso_archive archive(isoPath);
+
+  u64 totalSize = 0;
+  if (fs::file f(isoPath); f) {
+    totalSize = f.size();
+  }
+
+  // Empty sourceUri means: boot directly from GameInfo.path, which we set to
+  // the real ISO path via fetchGameInfo -> findIsoInDir. But that only works
+  // when the sidecar dir contains a copy of the .iso, which we skip on
+  // purpose. Instead, register the ISO's real filesystem path as the source
+  // URI (RPCSXActivity's boot path handles a plain path fine).
+  return registerIsoArchive(env, progressId, archive, isoPath, totalSize);
+}
+
+// Walk `rootDir` recursively looking for .iso files and register each. The
+// user-facing "Add ISO directory" flow calls this via _rpcsx_collectIsoInfo.
+static void collectIsoInfo(JNIEnv *env, jlong progressId,
+                           const std::string &rootDir) {
+  std::error_code ec;
+  std::vector<std::string> isoPaths;
+
+  if (std::filesystem::is_regular_file(rootDir, ec)) {
+    // Allow a single .iso file to be passed directly.
+    isoPaths.push_back(rootDir);
+  } else if (std::filesystem::is_directory(rootDir, ec)) {
+    std::vector<std::filesystem::path> workList;
+    workList.push_back(rootDir);
+    while (!workList.empty()) {
+      auto dir = std::move(workList.back());
+      workList.pop_back();
+
+      for (auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (entry.is_directory(ec)) {
+          workList.push_back(entry.path());
+          continue;
+        }
+        if (!entry.is_regular_file(ec)) {
+          continue;
+        }
+        auto ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (ext == ".iso") {
+          isoPaths.push_back(entry.path().string());
+        }
+      }
+    }
+  }
+
+  rpcsx_android.notice("collectIsoInfo: found %zu iso file(s) under '%s'",
+                       isoPaths.size(), rootDir);
+
+  Progress progress(env, progressId);
+  progress.report(0, isoPaths.size());
+
+  std::size_t processed = 0;
+  for (const auto &iso : isoPaths) {
+    if (!registerIsoByPath(env, /*progressId=*/-1, iso)) {
+      rpcsx_android.error("collectIsoInfo: failed to register '%s'", iso);
+    }
+    progress.report(++processed, isoPaths.size());
+  }
+
+  progress.success(processed);
+}
+
+// Android-only glue: resolves a Storage Access Framework DocumentsProvider
+// tree URI for the primary/secondary external storage volume to a real
+// filesystem path, e.g.
+//   content://com.android.externalstorage.documents/tree/primary%3AGames
+//     -> /storage/emulated/0/Games
+//   content://com.android.externalstorage.documents/tree/1234-5678%3APS3
+//     -> /storage/1234-5678/PS3
+// Returns an empty string if the URI is not a resolvable local-storage tree
+// (cloud providers, USB OTG document providers, etc.).
+static std::string resolveTreeUriToPath(std::string_view uri) {
+  constexpr std::string_view authorityMarker =
+      "com.android.externalstorage.documents/tree/";
+  auto authorityPos = uri.find(authorityMarker);
+  if (authorityPos == std::string_view::npos) {
+    return {};
+  }
+
+  auto encodedId = uri.substr(authorityPos + authorityMarker.size());
+
+  // Percent-decode the document id (it is "<volume>:<relative path>").
+  std::string decoded;
+  decoded.reserve(encodedId.size());
+  for (std::size_t i = 0; i < encodedId.size(); ++i) {
+    char c = encodedId[i];
+    if (c == '%' && i + 2 < encodedId.size()) {
+      auto hexToNibble = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        return -1;
+      };
+      int hi = hexToNibble(encodedId[i + 1]);
+      int lo = hexToNibble(encodedId[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        decoded.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    decoded.push_back(c);
+  }
+
+  auto colonPos = decoded.find(':');
+  if (colonPos == std::string::npos) {
+    return {};
+  }
+
+  const std::string volume = decoded.substr(0, colonPos);
+  std::string relative = decoded.substr(colonPos + 1);
+
+  std::string base;
+  if (volume == "primary") {
+    base = "/storage/emulated/0/";
+  } else if (!volume.empty()) {
+    base = "/storage/" + volume + "/";
+  } else {
+    return {};
+  }
+
+  if (!relative.empty()) {
+    base += relative;
+  } else {
+    base.pop_back();
+  }
+
+  return base;
+}
+
+// Exposes resolveTreeUriToPath to Kotlin so the UI never needs its own SAF
+// tree-URI parsing (e.g. to know what directory prefix to drop from the game
+// list when a managed directory is removed). Returns null if unresolvable.
+extern "C" jstring _rpcsx_resolveTreeUriToPath(JNIEnv *env,
+                                               std::string_view treeUri) {
+  const std::string path = resolveTreeUriToPath(treeUri);
+  if (path.empty()) {
+    return nullptr;
+  }
+  return wrap(env, path);
+}
+
+// "Add game folder" flow: resolves the SAF tree URI to a real path and
+// delegates to the existing native scanner (collectGameInfo), which already
+// detects a single game at the root or recurses into subdirectories looking
+// for PARAM.SFO. No copy: the game is registered in place. Returns false if
+// the URI cannot be resolved to a real, readable path (e.g. cloud storage) so
+// the caller can show an explicit error instead of falling back to a copy.
+extern "C" bool _rpcsx_collectGameInfoFromUri(JNIEnv *env,
+                                              std::string_view treeUri,
+                                              long progressId) {
+  const std::string path = resolveTreeUriToPath(treeUri);
+
+  if (path.empty()) {
+    return false;
+  }
+
+  std::error_code ec;
+  if (!std::filesystem::is_directory(path, ec)) {
+    return false;
+  }
+
+  // Probe readability - this is what actually confirms All-files access, not
+  // just that the path syntactically resolved.
+  {
+    std::error_code probeEc;
+    auto it = std::filesystem::directory_iterator(path, probeEc);
+    if (probeEc) {
+      return false;
+    }
+  }
+
+  collectGameInfo(env, progressId, {path});
+  return true;
+}
+
+// "Add ISO directory" flow: resolves the SAF tree URI to a real path and
+// scans it (recursively) for loose .iso files, registering each one in
+// place - the ISO is played directly from its real path, nothing is copied.
+// Returns false if the URI cannot be resolved (same fallback contract as
+// _rpcsx_collectGameInfoFromUri).
+extern "C" bool _rpcsx_collectIsoInfoFromUri(JNIEnv *env,
+                                             std::string_view treeUri,
+                                             long progressId) {
+  const std::string path = resolveTreeUriToPath(treeUri);
+
+  if (path.empty()) {
+    return false;
+  }
+
+  std::error_code ec;
+  if (!std::filesystem::is_directory(path, ec)) {
+    return false;
+  }
+
+  {
+    std::error_code probeEc;
+    auto it = std::filesystem::directory_iterator(path, probeEc);
+    if (probeEc) {
+      return false;
+    }
+  }
+
+  collectIsoInfo(env, progressId, path);
   return true;
 }
 

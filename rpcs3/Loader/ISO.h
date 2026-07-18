@@ -6,6 +6,14 @@
 #include "util/types.hpp"
 #include "Crypto/aes.h"
 
+#include <functional>
+
+// Factory that yields a fresh, independent handle to the ISO image on every
+// call. Used by iso_archive to avoid reopening by path - important on Android
+// where SAF-backed fds have no reopenable /proc/self/fd/N path (SELinux
+// blocks it). Desktop path-based construction uses fs::file(path) inside.
+using iso_open_fn = std::function<fs::file()>;
+
 bool is_iso_file(const std::string& path, u64* size = nullptr, bool* is_raw_device = nullptr);
 bool is_iso_file(fs::file& file, u64* size = nullptr);
 
@@ -76,7 +84,7 @@ public:
 
 	iso_encryption_type get_enc_type() const { return m_enc_type; }
 
-	bool init(const std::string& path, iso_archive* archive = nullptr);
+	bool init(iso_archive& archive);
 	bool decrypt(u64 offset, void* buffer, u64 size, const std::string& name);
 };
 
@@ -119,6 +127,11 @@ protected:
 public:
 	iso_file(const std::string& path, bs_t<fs::open_mode> mode = fs::read);
 	iso_file(const std::string& path, bs_t<fs::open_mode> mode, const iso_fs_node& node);
+	// File-first ctors: take ownership of an already-opened fs::file. The
+	// caller must guarantee the file is independent (no shared file offset
+	// with other iso_file instances). Raw-device detection is skipped.
+	explicit iso_file(fs::file&& file);
+	iso_file(fs::file&& file, const iso_fs_node& node);
 
 	explicit operator bool() const { return m_file.operator bool(); }
 
@@ -142,6 +155,7 @@ private:
 
 public:
 	iso_file_encrypted(const std::string& path, bs_t<fs::open_mode> mode, const iso_fs_node& node, std::shared_ptr<iso_file_decryption> dec);
+	iso_file_encrypted(fs::file&& file, const iso_fs_node& node, std::shared_ptr<iso_file_decryption> dec);
 
 	u64 read_at(u64 offset, void* buffer, u64 size) override;
 };
@@ -166,24 +180,36 @@ class iso_archive
 {
 private:
 	std::string m_path;
+	iso_open_fn m_open;
+	bool m_file_backed = false;
 	iso_fs_node m_root {};
 	std::shared_ptr<iso_file_decryption> m_dec;
 
+	void init_from_opener();
+
 public:
+	// Path-based ctor: opens `path` (and dup'd copies on demand). Desktop.
 	iso_archive(const std::string& path);
+	// File-first ctor: uses `opener` to obtain independent fs::file handles
+	// on demand. `display_path` is kept for logging only and does not need
+	// to be a real filesystem path (e.g. "saf-fd:12").
+	iso_archive(iso_open_fn opener, std::string display_path);
 
 	const std::string& path() const { return m_path; }
+	bool is_file_backed() const { return m_file_backed; }
+	fs::file open_source() const { return m_open ? m_open() : fs::file{}; }
 	const iso_fs_node& root() const { return m_root; }
 
 	iso_fs_node* retrieve(const std::string& path);
 	bool exists(const std::string& path);
 	bool is_file(const std::string& path);
 
-	std::unique_ptr<fs::file_base> get_iso_file(const std::string& path, bs_t<fs::open_mode> mode, const iso_fs_node& node);
+	std::unique_ptr<fs::file_base> get_iso_file(bs_t<fs::open_mode> mode, const iso_fs_node& node);
 	std::unique_ptr<fs::file_base> open(const std::string& path);
 	psf::registry open_psf(const std::string& path);
 
 	friend class iso_file;
+	friend class iso_file_decryption;
 };
 
 class iso_device : public fs::device_base
