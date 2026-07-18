@@ -110,6 +110,16 @@ set(LLVM_HOST_TRIPLE "${CMAKE_SYSTEM_PROCESSOR}-none-linux-android${ANDROID_NATI
 set(USE_DISCORD_RPC off)
 set(USE_SDL off)
 set(USE_FAUDIO off)
+
+# Audio: rpcs3's audio backend on Android is cubeb, whose own CMakeLists
+# enables its OpenSL ES / AAudio backends via check_include_files() probes.
+# If those probes silently fail during the NDK cross-configure, cubeb builds
+# with NO platform backend at all - cubeb_init() then always fails at runtime
+# and the emulator falls back to the Null (silent) audio renderer. Both
+# headers/libs are guaranteed to exist in every supported NDK, so force the
+# probe results instead of trusting detection.
+set(USE_AAUDIO 1 CACHE INTERNAL "cubeb: force AAudio backend on Android")
+set(USE_OPENSL 1 CACHE INTERNAL "cubeb: force OpenSL ES backend on Android")
 set(USE_LIBEVDEV off)
 set(USE_SYSTEM_LIBUSB off)
 set(USE_SYSTEM_CURL off)

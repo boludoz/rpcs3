@@ -597,6 +597,7 @@ struct GameInfo {
   std::string name;
   std::string iconPath;
   int flags = 0;
+  std::string sourceUri;
 };
 
 class Progress {
@@ -656,7 +657,7 @@ static void sendGameInfo(JNIEnv *env, jlong progressId,
 
   jmethodID gameConstructor = ensure(env->GetMethodID(
       gameClass, "<init>",
-      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V"));
+      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;)V"));
 
   std::vector<jobject> objects;
   objects.reserve(infos.size());
@@ -670,7 +671,8 @@ static void sendGameInfo(JNIEnv *env, jlong progressId,
     objects.push_back(env->NewObject(
         gameClass, gameConstructor, wrap(env, path), wrap(env, info.name),
         wrap(env, Emu.GetCallbacks().resolve_path(info.iconPath)),
-        jint(info.flags)));
+        jint(info.flags),
+        info.sourceUri.empty() ? nullptr : wrap(env, info.sourceUri)));
   }
 
   auto result = env->NewObjectArray(objects.size(), gameClass, nullptr);
@@ -1559,6 +1561,8 @@ static void setupCallbacks() {
                   result->GetName());
               result = std::make_shared<NullAudioBackend>();
             }
+
+            rpcsx_android.notice("Active audio backend: %s", result->GetName());
             return result;
           },
       .get_audio_enumerator = [](auto...) { return nullptr; },
@@ -1929,6 +1933,17 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
 
   g_cfg.core.llvm_cpu.from_string("oryon-1");
   g_cfg.core.llvm_threads.from_string("1");
+
+  // Audio output on Android goes through cubeb (OpenSL ES / AAudio).
+  // WITHOUT_OPENAL only disables cellMic microphone capture - it does not
+  // affect game audio. However, configs persisted by older builds may carry
+  // "Renderer: Null", which leaves the emulator silent even though cubeb
+  // works fine; snap those back to cubeb here.
+  if (g_cfg.audio.renderer.get() == audio_renderer::null) {
+    rpcsx_android.warning(
+        "Audio renderer was Null (stale config?), resetting to Cubeb");
+    g_cfg.audio.renderer.set(audio_renderer::cubeb);
+  }
 
   Emulator::SaveSettings(g_cfg.to_string(), Emu.GetTitleID());
   return true;
@@ -2424,7 +2439,7 @@ static bool installRap(JNIEnv *env, fs::file &&file, jlong progressId,
 // sidecar files for the game list UI. The .iso itself is copied once into the
 // games dir and booted directly - Emu.BootGame() mounts it via load_iso().
 // Layout: games/<TITLE_ID>/<TITLE_ID>.iso + PS3_GAME/{PARAM.SFO,ICON0.PNG,...}
-static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
+static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::string_view sourceUri) {
   Progress progress(env, progressId);
 
   if (file.get_handle() < 0) {
@@ -2439,48 +2454,15 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
     return false;
   }
 
-  const std::string gamesDir = fs::get_config_dir() + "games/";
-  std::error_code ec;
-  std::filesystem::create_directories(gamesDir, ec);
-
-  const std::string tempIsoPath = gamesDir + "_temp_install.iso";
   const u64 totalSize = file.size();
   progress.report(0, totalSize);
 
-  {
-    fs::file dst(tempIsoPath, fs::create + fs::trunc + fs::write);
-    if (!dst) {
-      progress.failure("Failed to create temporary ISO file");
-      return false;
-    }
-
-    file.seek(0);
-    std::vector<u8> buffer(16u * 1024 * 1024);
-    u64 written = 0;
-
-    while (written < totalSize) {
-      const u64 block = file.read(buffer.data(), buffer.size());
-      if (!block || dst.write(buffer.data(), block) != block) {
-        break;
-      }
-      written += block;
-      progress.report(written, totalSize);
-    }
-
-    if (written != totalSize) {
-      dst.close();
-      fs::remove_file(tempIsoPath);
-      progress.failure("Failed to copy ISO (out of space?)");
-      return false;
-    }
-  }
-
-  iso_archive archive(tempIsoPath);
+  std::string fdPath = fmt::format("/proc/self/fd/{}", file.get_handle());
+  iso_archive archive(fdPath);
   const auto sfo = archive.open_psf("PS3_GAME/PARAM.SFO");
   const auto title_id = psf::get_string(sfo, "TITLE_ID");
 
   if (title_id.empty()) {
-    fs::remove_file(tempIsoPath);
     rpcsx_android.error(
         "installIso: no TITLE_ID in PS3_GAME/PARAM.SFO (sfo entries: %zu)",
         sfo.size());
@@ -2489,6 +2471,10 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
   }
 
   rpcsx_android.notice("installIso: installing '%s'", title_id);
+
+  const std::string gamesDir = fs::get_config_dir() + "games/";
+  std::error_code ec;
+  std::filesystem::create_directories(gamesDir, ec);
 
   const std::filesystem::path destinationPath = gamesDir + std::string(title_id);
   std::filesystem::create_directories(destinationPath / "PS3_GAME", ec);
@@ -2516,22 +2502,16 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
   }
 
   if (!std::filesystem::is_regular_file(destinationPath / "PS3_GAME/PARAM.SFO")) {
-    fs::remove_file(tempIsoPath);
     progress.failure("Failed to extract PARAM.SFO from ISO");
     return false;
   }
 
-  const std::filesystem::path finalIsoPath =
-      destinationPath / (std::string(title_id) + ".iso");
-  
-  std::filesystem::rename(tempIsoPath, finalIsoPath, ec);
-  if (ec) {
-    std::filesystem::copy_file(tempIsoPath, finalIsoPath,
-                                std::filesystem::copy_options::overwrite_existing, ec);
-    fs::remove_file(tempIsoPath);
+  auto localPsf = psf::load_object(destinationPath / "PS3_GAME/PARAM.SFO");
+  if (auto gameInfo = fetchGameInfo(localPsf, destinationPath)) {
+    gameInfo->sourceUri = std::string(sourceUri);
+    sendGameInfo(env, progressId, {{*gameInfo}});
   }
 
-  collectGameInfo(env, -1, {destinationPath.string()});
   progress.success(totalSize);
   return true;
 }
@@ -2562,7 +2542,7 @@ extern "C" jstring _rpcsx_getDirInstallPath(JNIEnv *env, jint fd) {
   return nullptr;
 }
 
-extern "C" bool _rpcsx_install(JNIEnv *env, int fd, long progressId) {
+extern "C" bool _rpcsx_install(JNIEnv *env, int fd, long progressId, std::string_view sourceUri) {
   auto file = fs::file::from_native_handle(fd);
   AtExit atExit{[&] { file.release_handle(); }};
 
@@ -2584,7 +2564,7 @@ extern "C" bool _rpcsx_install(JNIEnv *env, int fd, long progressId) {
     return installEdat(env, std::move(file), progressId);
 
   case FileType::Iso:
-    return installIso(env, std::move(file), progressId);
+    return installIso(env, std::move(file), progressId, sourceUri);
 
   case FileType::Rap:
     Progress(env, progressId)
