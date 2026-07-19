@@ -734,6 +734,12 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 			backend_config.supports_passthrough_dma = false;
 		}
 		break;
+	case vk::driver_vendor::TURNIP:
+	case vk::driver_vendor::QUALCOMM_ADRENO:
+	case vk::driver_vendor::ARM_MALI:
+		rsx_log.notice("Configuring optimizations for tile-based mobile GPU driver (Turnip/Adreno/Mali)");
+		backend_config.supports_passthrough_dma = false;
+		break;
 	default: break;
 	}
 

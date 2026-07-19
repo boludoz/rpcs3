@@ -343,6 +343,14 @@ namespace vk
 			{ // e.g. "Mali-G610", hence "else"
 				return driver_vendor::ARM_MALI;
 			}
+			if (gpu_name.find("Turnip") != umax || gpu_name.find("tu ") != umax || gpu_name.find("turnip") != umax)
+			{
+				return driver_vendor::TURNIP;
+			}
+			if (gpu_name.find("Adreno") != umax)
+			{
+				return driver_vendor::QUALCOMM_ADRENO;
+			}
 
 			return driver_vendor::unknown;
 		}
@@ -376,7 +384,10 @@ namespace vk
 			case VK_DRIVER_ID_ARM_PROPRIETARY:
 				return driver_vendor::ARM_MALI;
 			default:
-				// Mobile?
+				if (get_name().find("Turnip") != umax || get_name().find("tu ") != umax || get_name().find("turnip") != umax)
+					return driver_vendor::TURNIP;
+				if (get_name().find("Adreno") != umax || get_name().find("Qualcomm") != umax)
+					return driver_vendor::QUALCOMM_ADRENO;
 				return driver_vendor::unknown;
 			}
 		}

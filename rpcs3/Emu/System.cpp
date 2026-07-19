@@ -1556,11 +1556,18 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		}
 
 		const std::string resolved_path = GetCallbacks().resolve_path(m_path);
-		if (!launching_from_disc_archive && is_iso_file(m_path))
+		// A path into the virtual ISO device means the caller already mounted
+		// the image via load_iso() (path-less sources such as Android SAF file
+		// descriptors) - treat it as a disc archive boot without re-mounting.
+		const bool iso_premounted = m_path.starts_with(iso_device::virtual_device_name);
+		if (!launching_from_disc_archive && (iso_premounted || is_iso_file(m_path)))
 		{
-			sys_log.notice("Loading iso archive '%s'", m_path);
+			if (!iso_premounted)
+			{
+				sys_log.notice("Loading iso archive '%s'", m_path);
 
-			load_iso(m_path);
+				load_iso(m_path);
+			}
 
 			launching_from_disc_archive = true;
 

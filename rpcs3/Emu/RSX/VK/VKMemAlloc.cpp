@@ -55,6 +55,10 @@ private:
 #pragma GCC diagnostic ignored "-Wsuggest-attribute=noreturn"
 #endif
 #endif
+// VulkanAPI.h must come first: on Android it turns the Vulkan entry points
+// into runtime-resolved pointers (VK_NO_PROTOTYPES + VKDynamicSymbols.h), and
+// VMA has to pick those up instead of linking libvulkan directly.
+#include "VulkanAPI.h"
 #include <vk_mem_alloc.h>
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma warning(pop)

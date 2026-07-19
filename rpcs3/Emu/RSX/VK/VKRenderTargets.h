@@ -189,6 +189,8 @@ namespace vk
 			case driver_vendor::HONEYKRISP:
 			case driver_vendor::PANVK:
 			case driver_vendor::ARM_MALI:
+			case driver_vendor::TURNIP:
+			case driver_vendor::QUALCOMM_ADRENO:
 				break;
 			}
 
