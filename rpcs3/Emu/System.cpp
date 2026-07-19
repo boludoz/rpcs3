@@ -496,7 +496,24 @@ void Emulator::Init()
 
 	g_cfg_defaults = g_cfg.to_string();
 
+#ifdef ANDROID
+	const std::string cfg_path = fs::get_config_dir(true) + "config.json";
+
+	// Migrate the config of older Android builds. The YAML content parses
+	// as-is (the loader below is a YAML parser either way); the file is
+	// rewritten as JSON on the next settings save.
+	if (const std::string old_yml_path = fs::get_config_dir(true) + "config.yml"; fs::is_file(old_yml_path))
+	{
+		sys_log.notice("Found deprecated config.yml file: '%s'", old_yml_path);
+
+		if (!fs::rename(old_yml_path, cfg_path, false))
+		{
+			(fs::g_tls_error == fs::error::exist ? sys_log.warning : sys_log.error)("Failed to move '%s' to '%s' (error='%s')", old_yml_path, cfg_path, fs::g_tls_error);
+		}
+	}
+#else
 	const std::string cfg_path = fs::get_config_dir(true) + "config.yml";
+#endif
 
 	// Move file from deprecated location to new location
 #ifdef _WIN32
@@ -1556,11 +1573,18 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		}
 
 		const std::string resolved_path = GetCallbacks().resolve_path(m_path);
-		if (!launching_from_disc_archive && is_iso_file(m_path))
+		// A path into the virtual ISO device means the caller already mounted
+		// the image via load_iso() (path-less sources such as Android SAF file
+		// descriptors) - treat it as a disc archive boot without re-mounting.
+		const bool iso_premounted = m_path.starts_with(iso_device::virtual_device_name);
+		if (!launching_from_disc_archive && (iso_premounted || is_iso_file(m_path)))
 		{
-			sys_log.notice("Loading iso archive '%s'", m_path);
+			if (!iso_premounted)
+			{
+				sys_log.notice("Loading iso archive '%s'", m_path);
 
-			load_iso(m_path);
+				load_iso(m_path);
+			}
 
 			launching_from_disc_archive = true;
 
@@ -1681,7 +1705,11 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			}
 			else if (m_config_mode == cfg_mode::custom)
 			{
-				// Load custom configs
+#ifndef ANDROID
+				// Load custom configs. On Android per-game configuration is
+				// owned by the frontend, which passes it explicitly via
+				// cfg_mode::custom_selection; the legacy per-title lookup
+				// would silently apply stale files old builds left behind.
 				for (std::string config_path :
 				{
 					m_path + ".yml",
@@ -1714,6 +1742,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 						sys_log.fatal("Failed to apply custom config: %s", config_path);
 					}
 				}
+#endif
 			}
 
 			if (m_add_database_config && m_db_config && !m_db_config->empty())
@@ -4896,7 +4925,11 @@ void Emulator::SaveSettings(std::string_view settings, const std::string& title_
 
 	if (title_id.empty())
 	{
+#ifdef ANDROID
+		config_name = fs::get_config_dir(true) + "config.json";
+#else
 		config_name = fs::get_config_dir(true) + "config.yml";
+#endif
 	}
 	else
 	{
@@ -4904,6 +4937,7 @@ void Emulator::SaveSettings(std::string_view settings, const std::string& title_
 	}
 
 	// Save config atomically
+	fs::create_path(fs::get_parent_dir(config_name));
 	fs::pending_file temp(config_name);
 	if (!temp.file)
 	{

@@ -179,6 +179,11 @@ namespace vk
 		allocatorInfo.instance = inst;
 		allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_2;
 
+		VmaVulkanFunctions vulkanFunctions = {};
+		vulkanFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+		vulkanFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+		allocatorInfo.pVulkanFunctions = &vulkanFunctions;
+
 		std::vector<VkDeviceSize> heap_limits;
 		const auto vram_allocation_limit = g_cfg.video.vk.vram_allocation_limit * 0x100000ull;
 		if (vram_allocation_limit < dev.get_memory_mapping().device_local_total_bytes)

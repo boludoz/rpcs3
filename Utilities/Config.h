@@ -118,6 +118,17 @@ namespace cfg
 			return {};
 		}
 
+		// Convert allowed range to string (optional, valid for integer types)
+		virtual std::string min_to_string() const
+		{
+			return {};
+		}
+
+		virtual std::string max_to_string() const
+		{
+			return {};
+		}
+
 		// Set multiple values. Implementation-specific, optional.
 		virtual bool from_list(std::vector<std::string>&&);
 
@@ -382,6 +393,16 @@ namespace cfg
 			return std::to_string(def);
 		}
 
+		std::string min_to_string() const override
+		{
+			return std::to_string(Min);
+		}
+
+		std::string max_to_string() const override
+		{
+			return std::to_string(Max);
+		}
+
 		bool from_string(std::string_view value, bool /*dynamic*/ = false) override
 		{
 			s64 result;
@@ -558,6 +579,16 @@ namespace cfg
 		std::string def_to_string() const override
 		{
 			return std::to_string(def);
+		}
+
+		std::string min_to_string() const override
+		{
+			return std::to_string(Min);
+		}
+
+		std::string max_to_string() const override
+		{
+			return std::to_string(Max);
 		}
 
 		bool from_string(std::string_view value, bool /*dynamic*/ = false) override
