@@ -1959,7 +1959,7 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
   g_cfg_input.save("", g_cfg_input_configs.default_config);
 
   g_cfg.core.llvm_cpu.from_string("oryon-1");
-  g_cfg.core.llvm_threads.from_string("3");
+  g_cfg.core.llvm_threads.from_string("1");
 
   // The upstream default (async_with_interpreter) stalls the Adreno driver
   // precompiling interpreter variants, and the async recompiler's worker
