@@ -38,12 +38,22 @@ LOG_CHANNEL(jit_log, "JIT");
 #include <llvm/Support/CodeGen.h>
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/TargetParser/Host.h"
-#include "llvm/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/ExecutionEngine/Orc/Core.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
+#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/ExecutionEngine/RTDyldMemoryManager.h"
 #include "llvm/ExecutionEngine/ObjectCache.h"
 #include "llvm/ExecutionEngine/JITEventListener.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/SymbolSize.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/SmallVectorMemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #else
@@ -97,7 +107,6 @@ const bool jit_initialize = []() -> bool
 	llvm::InitializeNativeTarget();
 	llvm::InitializeNativeTargetAsmPrinter();
 	llvm::InitializeNativeTargetAsmParser();
-	LLVMLinkInMCJIT();
 	return true;
 }();
 
@@ -114,6 +123,9 @@ namespace vm
 static shared_mutex null_mtx;
 
 static std::unordered_map<std::string, u64> null_funcs;
+
+// Protects jit_compiler::m_global_mapping (all instances)
+static shared_mutex s_mutex;
 
 static u64 make_null_function(const std::string& name)
 {
@@ -234,12 +246,7 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 	u64 data_ro_ptr = 0;
 	u64 data_rw_ptr = 0;
 
-	// First fallback for non-existing symbols
-	// May be a memory container internally
-	std::function<u64(const std::string&)> m_symbols_cement;
-
-	MemoryManager1(std::function<u64(const std::string&)> symbols_cement = {}) noexcept
-		: m_symbols_cement(std::move(symbols_cement))
+	MemoryManager1() noexcept
 	{
 		auto ptr = reinterpret_cast<u8*>(utils::memory_reserve(c_max_size * 3, true));
 		m_code_mems = ptr;
@@ -261,28 +268,6 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 		// utils::memory_decommit(m_data_ro_mems, how_much(data_ro_ptr));
 		// utils::memory_decommit(m_data_rw_mems, how_much(data_rw_ptr));
 		utils::memory_decommit(m_code_mems, c_max_size * 3, true);
-	}
-
-	llvm::JITSymbol findSymbol(const std::string& name) override
-	{
-		u64 addr = RTDyldMemoryManager::getSymbolAddress(name);
-
-		if (!addr && m_symbols_cement)
-		{
-			addr = m_symbols_cement(name);
-		}
-
-		if (!addr)
-		{
-			addr = make_null_function(name);
-
-			if (!addr)
-			{
-				fmt::throw_exception("Failed to link '%s'", name);
-			}
-		}
-
-		return {addr, llvm::JITSymbolFlags::Exported};
 	}
 
 	u8* allocate(u64& alloc_pos, void* block, uptr size, u64 align, utils::protection prot)
@@ -377,39 +362,10 @@ struct MemoryManager1 : llvm::RTDyldMemoryManager
 // Simple memory manager
 struct MemoryManager2 : llvm::RTDyldMemoryManager
 {
-	// First fallback for non-existing symbols
-	// May be a memory container internally
-	std::function<u64(const std::string&)> m_symbols_cement;
-
-	MemoryManager2(std::function<u64(const std::string&)> symbols_cement = {}) noexcept
-		: m_symbols_cement(std::move(symbols_cement))
-	{
-	}
+	MemoryManager2() noexcept = default;
 
 	~MemoryManager2() override
 	{
-	}
-
-	llvm::JITSymbol findSymbol(const std::string& name) override
-	{
-		u64 addr = RTDyldMemoryManager::getSymbolAddress(name);
-
-		if (!addr && m_symbols_cement)
-		{
-			addr = m_symbols_cement(name);
-		}
-
-		if (!addr)
-		{
-			addr = make_null_function(name);
-
-			if (!addr)
-			{
-				fmt::throw_exception("Failed to link '%s' (MM2)", name);
-			}
-		}
-
-		return {addr, llvm::JITSymbolFlags::Exported};
 	}
 
 	u8* allocateCodeSection(uptr size, uint align, uint /*sec_id*/, llvm::StringRef /*sec_name*/) override
@@ -433,6 +389,73 @@ struct MemoryManager2 : llvm::RTDyldMemoryManager
 
 	void deregisterEHFrames() override
 	{
+	}
+};
+
+struct ProxyMemoryManager : public llvm::RTDyldMemoryManager
+{
+	std::shared_ptr<llvm::RTDyldMemoryManager> m_impl;
+
+	ProxyMemoryManager(std::shared_ptr<llvm::RTDyldMemoryManager> impl)
+		: m_impl(std::move(impl))
+	{
+	}
+
+	u8* allocateCodeSection(uptr size, uint align, uint sec_id, llvm::StringRef sec_name) override
+	{
+		return m_impl->allocateCodeSection(size, align, sec_id, sec_name);
+	}
+
+	u8* allocateDataSection(uptr size, uint align, uint sec_id, llvm::StringRef sec_name, bool is_ro) override
+	{
+		return m_impl->allocateDataSection(size, align, sec_id, sec_name, is_ro);
+	}
+
+	bool finalizeMemory(std::string* ErrMsg = nullptr) override
+	{
+		return m_impl->finalizeMemory(ErrMsg);
+	}
+
+	void registerEHFrames(u8* Addr, u64 LoadAddr, usz Size) override
+	{
+		m_impl->registerEHFrames(Addr, LoadAddr, Size);
+	}
+
+	void deregisterEHFrames() override
+	{
+		m_impl->deregisterEHFrames();
+	}
+};
+
+// Resolves otherwise-undefined symbols via a custom callback (absolute symbols).
+// Returning 0 from the callback means "not handled" (the lookup continues with the next generator).
+struct jit_symbol_generator final : llvm::orc::DefinitionGenerator
+{
+	std::function<u64(const std::string&)> resolve;
+
+	jit_symbol_generator(std::function<u64(const std::string&)> func) noexcept
+		: resolve(std::move(func))
+	{
+	}
+
+	llvm::Error tryToGenerate(llvm::orc::LookupState&, llvm::orc::LookupKind, llvm::orc::JITDylib& jd, llvm::orc::JITDylibLookupFlags, const llvm::orc::SymbolLookupSet& set) override
+	{
+		llvm::orc::SymbolMap symbols;
+
+		for (const auto& [name, flags] : set)
+		{
+			if (const u64 addr = resolve((*name).str()))
+			{
+				symbols[name] = {llvm::orc::ExecutorAddr(addr), llvm::JITSymbolFlags::Exported};
+			}
+		}
+
+		if (symbols.empty())
+		{
+			return llvm::Error::success();
+		}
+
+		return jd.define(llvm::orc::absoluteSymbols(std::move(symbols)));
 	}
 };
 
@@ -682,7 +705,7 @@ bool jit_compiler::add_sub_disk_space(ssz space)
 }
 
 jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, std::string_view _cpu, u32 flags, std::function<u64(const std::string&)> symbols_cement) noexcept
-	: m_context(new llvm::LLVMContext)
+	: m_context(std::make_unique<llvm::orc::ThreadSafeContext>(std::make_unique<llvm::LLVMContext>()))
 	, m_cpu(cpu(_cpu))
 {
 	[[maybe_unused]] static const bool s_install_llvm_error_handler = []()
@@ -704,37 +727,25 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, st
 		return true;
 	}();
 
-	std::string result;
-
-	auto null_mod = std::make_unique<llvm::Module> ("null_", *m_context);
-#if LLVM_VERSION_MAJOR >= 21 && (LLVM_VERSION_MINOR >= 1 || LLVM_VERSION_MAJOR >= 22)
-	null_mod->setTargetTriple(llvm::Triple(jit_compiler::triple1()));
-#else
-	null_mod->setTargetTriple(jit_compiler::triple1());
-#endif
-
-	std::unique_ptr<llvm::RTDyldMemoryManager> mem;
-
-	if (_link.empty())
+	std::string triple_str;
+	if (_link.empty() && !(flags & 0x1))
 	{
-		// Auxiliary JIT (does not use custom memory manager, only writes the objects)
-		if (flags & 0x1)
-		{
-			mem = std::make_unique<MemoryManager1>(std::move(symbols_cement));
-		}
-		else
-		{
-			mem = std::make_unique<MemoryManager2>(std::move(symbols_cement));
-#if LLVM_VERSION_MAJOR >= 21 && (LLVM_VERSION_MINOR >= 1 || LLVM_VERSION_MAJOR >= 22)
-			null_mod->setTargetTriple(llvm::Triple(jit_compiler::triple2()));
-#else
-			null_mod->setTargetTriple(jit_compiler::triple2());
-#endif
-		}
+		triple_str = jit_compiler::triple2();
 	}
 	else
 	{
-		mem = std::make_unique<MemoryManager1>(std::move(symbols_cement));
+		triple_str = jit_compiler::triple1();
+	}
+
+	std::shared_ptr<llvm::RTDyldMemoryManager> mem;
+
+	if (_link.empty() && !(flags & 0x1))
+	{
+		mem = std::make_shared<MemoryManager2>();
+	}
+	else
+	{
+		mem = std::make_shared<MemoryManager1>();
 	}
 
 	std::vector<std::string> attributes;
@@ -750,10 +761,6 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, st
 	else
 		attributes.push_back("-dotprod");
 
-	// The recompilers emit i8mm intrinsics (e.g. ummla) gated on utils::has_i8mm().
-	// The JIT target features must advertise i8mm too, otherwise the backend fails
-	// with "Cannot select: intrinsic %llvm.aarch64.neon.ummla" whenever the resolved
-	// -mcpu does not already imply it (e.g. the cortex-a78 fallback on Apple silicon).
 	if (utils::has_i8mm())
 		attributes.push_back("+i8mm");
 	else
@@ -770,40 +777,122 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, st
 		attributes.push_back("-sve2");
 #endif
 
+	llvm::Triple triple(triple_str);
+	llvm::orc::JITTargetMachineBuilder JTMB(triple);
+	JTMB.setCPU(m_cpu);
+	JTMB.setCodeModel(flags & 0x2 ? llvm::CodeModel::Large : llvm::CodeModel::Small);
+	JTMB.setRelocationModel(llvm::Reloc::Model::PIC_);
+	JTMB.setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
+	JTMB.addFeatures(attributes);
+
+	// Own a target machine with the same configuration for eager module compilation
+	if (auto tm = JTMB.createTargetMachine())
 	{
-		m_engine.reset(llvm::EngineBuilder(std::move(null_mod))
-			.setErrorStr(&result)
-			.setEngineKind(llvm::EngineKind::JIT)
-			.setMCJITMemoryManager(std::move(mem))
-			.setOptLevel(llvm::CodeGenOptLevel::Aggressive)
-			.setCodeModel(flags & 0x2 ? llvm::CodeModel::Large : llvm::CodeModel::Small)
-#ifdef __APPLE__
-			//.setCodeModel(llvm::CodeModel::Large)
-#endif
-			.setRelocationModel(llvm::Reloc::Model::PIC_)
-			.setMAttrs(attributes)
-			.setMCPU(m_cpu)
-			.create());
+		m_tm = std::move(*tm);
 	}
+	else
+	{
+		fmt::throw_exception("LLVM: Failed to create target machine: %s", llvm::toString(tm.takeError()));
+	}
+
+	auto Builder = std::make_unique<llvm::orc::LLJITBuilder>();
+	Builder->setJITTargetMachineBuilder(std::move(JTMB));
+
+	const bool link_not_empty = !_link.empty();
+	Builder->setObjectLinkingLayerCreator(
+		[mem, link_not_empty, flags](llvm::orc::ExecutionSession& ES, const llvm::Triple&)
+			-> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>>
+		{
+			auto getMemMgr = [mem]() -> std::unique_ptr<llvm::RTDyldMemoryManager>
+			{
+				return std::make_unique<ProxyMemoryManager>(mem);
+			};
+
+			auto Layer = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(ES, getMemMgr);
+
+			// Match RuntimeDyld symbol flags handling (weak symbols etc.) with ORC expectations
+			Layer->setOverrideObjectFlagsWithResponsibilityFlags(true);
+			Layer->setAutoClaimResponsibilityForObjectSymbols(true);
+
+			if (link_not_empty || !(flags & 0x1))
+			{
+				// Returns null if LLVM wasn't built with Intel JIT events support
+				if (auto* intel_listener = llvm::JITEventListener::createIntelJITEventListener())
+				{
+					Layer->registerJITEventListener(*intel_listener);
+				}
+
+				Layer->registerJITEventListener(*(new JITAnnouncer));
+			}
+
+			return Layer;
+		}
+	);
+
+	auto JITOrErr = Builder->create();
+	if (!JITOrErr)
+	{
+		fmt::throw_exception("LLVM: Failed to create LLJIT: %s", llvm::toString(JITOrErr.takeError()));
+	}
+
+	m_jit = std::move(*JITOrErr);
+
+	auto& jd = m_jit->getMainJITDylib();
 
 	if (!_link.empty())
 	{
+		llvm::orc::SymbolMap symbols;
 		for (auto&& [name, addr] : _link)
 		{
-			m_engine->updateGlobalMapping(name, addr);
+			symbols[m_jit->mangleAndIntern(name)] = {
+				llvm::orc::ExecutorAddr(addr),
+				llvm::JITSymbolFlags::Exported
+			};
+		}
+
+		if (auto Err = jd.define(llvm::orc::absoluteSymbols(std::move(symbols))))
+		{
+			fmt::throw_exception("LLVM: Failed to define linkage symbols: %s", llvm::toString(std::move(Err)));
 		}
 	}
 
-	if (!_link.empty() || !(flags & 0x1))
+	// Unresolved symbol lookup order (matches former MCJIT/RTDyldMemoryManager behavior):
+	// 1. Custom global mappings (update_global_mapping)
+	jd.addGenerator(std::make_unique<jit_symbol_generator>([this](const std::string& name) -> u64
 	{
-		m_engine->RegisterJITEventListener(llvm::JITEventListener::createIntelJITEventListener());
-		m_engine->RegisterJITEventListener(new JITAnnouncer);
+		std::lock_guard lock(s_mutex);
+
+		if (auto it = m_global_mapping.find(name); it != m_global_mapping.end())
+		{
+			return it->second;
+		}
+
+		return 0;
+	}));
+
+	// 2. Symbols from the process itself (memcpy, compiler-rt builtins, etc.)
+	if (auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(m_jit->getDataLayout().getGlobalPrefix()))
+	{
+		jd.addGenerator(std::move(*gen));
+	}
+	else
+	{
+		jit_log.error("LLVM: Failed to create process symbol generator: %s", llvm::toString(gen.takeError()));
 	}
 
-	if (!m_engine)
+	// 3. Symbols cementing, then guaranteed fallback to a named "null" function
+	jd.addGenerator(std::make_unique<jit_symbol_generator>([cement = std::move(symbols_cement)](const std::string& name) -> u64
 	{
-		fmt::throw_exception("LLVM: Failed to create ExecutionEngine: %s", result);
-	}
+		if (cement)
+		{
+			if (const u64 addr = cement(name))
+			{
+				return addr;
+			}
+		}
+
+		return make_null_function(name);
+	}));
 
 	fs::device_stat stats{};
 
@@ -813,12 +902,27 @@ jit_compiler::jit_compiler(const std::unordered_map<std::string, u64>& _link, st
 	}
 }
 
+llvm::LLVMContext& jit_compiler::get_context()
+{
+	return *m_context->getContext();
+}
+
+llvm::TargetMachine* jit_compiler::get_target_machine() const
+{
+	return m_tm.get();
+}
+
+const llvm::DataLayout& jit_compiler::get_data_layout() const
+{
+	return m_jit->getDataLayout();
+}
+
 jit_compiler& jit_compiler::operator=(thread_state s) noexcept
 {
 	if (s == thread_state::destroying_context)
 	{
 		// Release resources explicitly
-		m_engine.reset();
+		m_jit.reset();
 		m_context.reset();
 	}
 
@@ -829,83 +933,122 @@ jit_compiler::~jit_compiler() noexcept
 {
 }
 
+// Compile a module to an in-memory object file with the given target machine (eager codegen, like MCJIT did)
+static std::unique_ptr<llvm::MemoryBuffer> compile_object(llvm::TargetMachine* tm, llvm::Module* _module)
+{
+	llvm::SmallVector<char, 0> obj_data;
+	llvm::raw_svector_ostream obj_os(obj_data);
+
+	llvm::legacy::PassManager pm;
+
+	if (tm->addPassesToEmitFile(pm, obj_os, nullptr, llvm::CodeGenFileType::ObjectFile))
+	{
+		fmt::throw_exception("LLVM: Target does not support object emission");
+	}
+
+	pm.run(*_module);
+
+	return std::make_unique<llvm::SmallVectorMemoryBuffer>(std::move(obj_data), _module->getModuleIdentifier(), false);
+}
+
+// Get the name of any external function defined in the module (used to force linking in fin())
+static std::string get_module_entry_symbol(const llvm::Module& _module)
+{
+	for (const auto& func : _module.functions())
+	{
+		if (!func.isDeclaration() && !func.hasLocalLinkage())
+		{
+			return func.getName().str();
+		}
+	}
+
+	return {};
+}
+
+// Get the name of any global symbol defined in an object file (used to force linking in fin())
+static std::string get_object_entry_symbol(const llvm::object::ObjectFile& obj)
+{
+	for (const auto& sym : obj.symbols())
+	{
+		auto flags = sym.getFlags();
+
+		if (!flags)
+		{
+			llvm::consumeError(flags.takeError());
+			continue;
+		}
+
+		if ((*flags & llvm::object::SymbolRef::SF_Undefined) || !(*flags & llvm::object::SymbolRef::SF_Global))
+		{
+			continue;
+		}
+
+		if (auto name = sym.getName())
+		{
+			if (!name->empty())
+			{
+				return name->str();
+			}
+		}
+		else
+		{
+			llvm::consumeError(name.takeError());
+		}
+	}
+
+	return {};
+}
+
+// Add a compiled object to the JIT (linking is deferred until fin()/lookup)
+void jit_compiler::add_object(std::unique_ptr<llvm::MemoryBuffer> obj, std::string sym)
+{
+	if (!sym.empty())
+	{
+		m_pending_syms.emplace_back(std::move(sym));
+	}
+
+	if (auto Err = m_jit->addObjectFile(std::move(obj)))
+	{
+		fmt::throw_exception("LLVM: Failed to add object: %s", llvm::toString(std::move(Err)));
+	}
+}
+
 void jit_compiler::add(std::unique_ptr<llvm::Module> _module, const std::string& path)
 {
 	ObjectCache cache{path, this};
-	m_engine->setObjectCache(&cache);
 
-	const auto ptr = _module.get();
-	m_engine->addModule(std::move(_module));
-	m_engine->generateCodeForModule(ptr);
-	m_engine->setObjectCache(nullptr);
+	// Load the object from the disk cache if possible, otherwise compile and store it
+	std::unique_ptr<llvm::MemoryBuffer> obj = cache.getObject(_module.get());
 
-	for (auto& func : ptr->functions())
+	if (!obj)
 	{
-		// Delete IR to lower memory consumption
-		func.deleteBody();
+		obj = compile_object(m_tm.get(), _module.get());
+		cache.notifyObjectCompiled(_module.get(), obj->getMemBufferRef());
 	}
+
+	add_object(std::move(obj), get_module_entry_symbol(*_module));
 }
 
 bool jit_compiler::try_add(std::unique_ptr<llvm::Module> _module, const std::string& path, std::string& error)
 {
-	ObjectCache cache{path, this};
-	m_engine->setObjectCache(&cache);
-
-	const auto ptr = _module.get();
-	m_engine->addModule(std::move(_module));
-
-	if (!run_recoverable_llvm([&]()
+	return run_recoverable_llvm([&]()
 	{
-		m_engine->generateCodeForModule(ptr);
-	}, error))
-	{
-		return false;
-	}
-
-	m_engine->setObjectCache(nullptr);
-
-	for (auto& func : ptr->functions())
-	{
-		// Delete IR to lower memory consumption
-		func.deleteBody();
-	}
-
-	return true;
+		add(std::move(_module), path);
+	}, error);
 }
 
 void jit_compiler::add(std::unique_ptr<llvm::Module> _module)
 {
-	const auto ptr = _module.get();
-	m_engine->addModule(std::move(_module));
-	m_engine->generateCodeForModule(ptr);
-
-	for (auto& func : ptr->functions())
-	{
-		// Delete IR to lower memory consumption
-		func.deleteBody();
-	}
+	auto obj = compile_object(m_tm.get(), _module.get());
+	add_object(std::move(obj), get_module_entry_symbol(*_module));
 }
 
 bool jit_compiler::try_add(std::unique_ptr<llvm::Module> _module, std::string& error)
 {
-	const auto ptr = _module.get();
-	m_engine->addModule(std::move(_module));
-
-	if (!run_recoverable_llvm([&]()
+	return run_recoverable_llvm([&]()
 	{
-		m_engine->generateCodeForModule(ptr);
-	}, error))
-	{
-		return false;
-	}
-
-	for (auto& func : ptr->functions())
-	{
-		// Delete IR to lower memory consumption
-		func.deleteBody();
-	}
-
-	return true;
+		add(std::move(_module));
+	}, error);
 }
 
 bool jit_compiler::add(const std::string& path)
@@ -918,17 +1061,31 @@ bool jit_compiler::add(const std::string& path)
 		return false;
 	}
 
-	if (auto object_file = llvm::object::ObjectFile::createObjectFile(*cache))
+	std::string sym;
+
+	if (auto obj = llvm::object::ObjectFile::createObjectFile(cache->getMemBufferRef()))
 	{
-		m_engine->addObjectFile(llvm::object::OwningBinary<llvm::object::ObjectFile>(std::move(*object_file), std::move(cache)));
-		jit_log.trace("ObjectCache: Successfully added %s", path);
-		return true;
+		sym = get_object_entry_symbol(**obj);
 	}
 	else
 	{
-		jit_log.error("ObjectCache: Adding failed: %s", path);
+		jit_log.error("ObjectCache: Adding failed: %s (%s)", path, llvm::toString(obj.takeError()));
 		return false;
 	}
+
+	if (auto Err = m_jit->addObjectFile(std::move(cache)))
+	{
+		jit_log.error("ObjectCache: Adding failed: %s (%s)", path, llvm::toString(std::move(Err)));
+		return false;
+	}
+
+	if (!sym.empty())
+	{
+		m_pending_syms.emplace_back(std::move(sym));
+	}
+
+	jit_log.trace("ObjectCache: Successfully added %s", path);
+	return true;
 }
 
 bool jit_compiler::check(const std::string& path)
@@ -951,25 +1108,59 @@ bool jit_compiler::check(const std::string& path)
 
 void jit_compiler::update_global_mapping(const std::string& name, u64 addr)
 {
-	m_engine->updateGlobalMapping(name, addr);
+	// Consulted by the JIT for otherwise-unresolved symbols (replace semantics, like MCJIT)
+	std::lock_guard lock(s_mutex);
+	m_global_mapping[name] = addr;
+}
+
+void jit_compiler::clear_global_mapping()
+{
+	std::lock_guard lock(s_mutex);
+	m_global_mapping.clear();
 }
 
 void jit_compiler::fin()
 {
-	m_engine->finalizeObject();
+	// Force linking of all pending objects (like MCJIT finalizeObject)
+	for (const std::string& name : std::exchange(m_pending_syms, {}))
+	{
+		if (auto sym = m_jit->lookup(name); !sym)
+		{
+			fmt::throw_exception("LLVM: Failed to link object of '%s': %s", name, llvm::toString(sym.takeError()));
+		}
+	}
 }
 
 bool jit_compiler::try_fin(std::string& error)
 {
-	return run_recoverable_llvm([&]()
+	const std::vector<std::string> pending = std::exchange(m_pending_syms, {});
+
+	const bool result = run_recoverable_llvm([&]()
 	{
-		m_engine->finalizeObject();
+		for (const std::string& name : pending)
+		{
+			if (auto sym = m_jit->lookup(name); !sym)
+			{
+				error = llvm::toString(sym.takeError());
+				return;
+			}
+		}
 	}, error);
+
+	return result && error.empty();
 }
 
 u64 jit_compiler::get(const std::string& name)
 {
-	return m_engine->getGlobalValueAddress(name);
+	if (auto sym = m_jit->lookup(name))
+	{
+		return sym->getValue();
+	}
+	else
+	{
+		jit_log.error("LLVM: Failed to lookup '%s': %s", name, llvm::toString(sym.takeError()));
+		return 0;
+	}
 }
 
 const char * fallback_cpu_detection()

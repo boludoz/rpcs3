@@ -28,13 +28,13 @@ const ppu_decoder<PPUTranslator> s_ppu_decoder;
 extern const ppu_decoder<ppu_itype> g_ppu_itype;
 extern const ppu_decoder<ppu_iname> g_ppu_iname;
 
-PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine)
+PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, jit_compiler& compiler)
 	: cpu_translator(_module, false)
 	, m_info(info)
 	, m_pure_attr()
 {
 	// Bind context
-	cpu_translator::initialize(context, engine);
+	cpu_translator::initialize(context, compiler);
 
 	// Initialize transform passes
 	clear_transforms();

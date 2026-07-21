@@ -43,6 +43,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 #include <util/v128.hpp>
 
 #if defined(ARCH_X64)
@@ -523,9 +524,17 @@ inline FT build_function_asm(std::string_view name, F&& builder, ::jit_runtime* 
 namespace llvm
 {
 	class LLVMContext;
-	class ExecutionEngine;
+	class MemoryBuffer;
 	class Module;
 	class StringRef;
+	class TargetMachine;
+	class DataLayout;
+
+	namespace orc
+	{
+		class LLJIT;
+		class ThreadSafeContext;
+	}
 }
 
 enum class thread_state : u32;
@@ -534,10 +543,20 @@ enum class thread_state : u32;
 class jit_compiler final
 {
 	// Local LLVM context
-	std::unique_ptr<llvm::LLVMContext> m_context{};
+	std::unique_ptr<llvm::orc::ThreadSafeContext> m_context{};
+
+	// Custom absolute symbol mappings, consulted for otherwise-unresolved symbols
+	// (replacement for MCJIT updateGlobalMapping, with the same replace semantics)
+	std::unordered_map<std::string, u64> m_global_mapping{};
+
+	// Owned target machine for eager module compilation (LLJIT does not expose one)
+	std::unique_ptr<llvm::TargetMachine> m_tm{};
 
 	// Execution instance
-	std::unique_ptr<llvm::ExecutionEngine> m_engine{};
+	std::unique_ptr<llvm::orc::LLJIT> m_jit{};
+
+	// One symbol per added (not yet linked) object, looked up in fin() to force linking
+	std::vector<std::string> m_pending_syms{};
 
 	// Arch
 	std::string m_cpu{};
@@ -545,21 +564,24 @@ class jit_compiler final
 	// Disk Space left
 	atomic_t<usz> m_disk_space = umax;
 
+	// Add a compiled object to the JIT
+	void add_object(std::unique_ptr<llvm::MemoryBuffer> obj, std::string sym);
+
 public:
 	jit_compiler(const std::unordered_map<std::string, u64>& _link, std::string_view _cpu, u32 flags = 0, std::function<u64(const std::string&)> symbols_cement = {}) noexcept;
 	jit_compiler& operator=(thread_state) noexcept;
 	~jit_compiler() noexcept;
 
 	// Get LLVM context
-	auto& get_context()
+	llvm::LLVMContext& get_context();
+
+	auto& get_jit() const
 	{
-		return *m_context;
+		return *m_jit;
 	}
 
-	auto& get_engine() const
-	{
-		return *m_engine;
-	}
+	llvm::TargetMachine* get_target_machine() const;
+	const llvm::DataLayout& get_data_layout() const;
 
 	// Add module (path to obj cache dir)
 	void add(std::unique_ptr<llvm::Module> _module, const std::string& path);
@@ -578,6 +600,9 @@ public:
 
 	// Update global mapping for a single value
 	void update_global_mapping(const std::string& name, u64 addr);
+
+	// Remove all custom global mappings
+	void clear_global_mapping();
 
 	// Check object file
 	static bool check(const std::string& path);

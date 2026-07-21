@@ -91,12 +91,12 @@ cpu_translator::cpu_translator(llvm::Module* _module, bool is_be)
 	});
 }
 
-void cpu_translator::initialize(llvm::LLVMContext& context, llvm::ExecutionEngine& engine)
+void cpu_translator::initialize(llvm::LLVMContext& context, jit_compiler& compiler)
 {
 	m_context = context;
-	m_engine = &engine;
+	m_compiler = &compiler;
 
-	auto cpu = m_engine->getTargetMachine()->getTargetCPU();
+	auto cpu = m_compiler->get_target_machine()->getTargetCPU();
 
 	if (cpu == "generic")
 	{

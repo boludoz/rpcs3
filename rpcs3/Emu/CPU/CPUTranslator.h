@@ -3211,8 +3211,8 @@ protected:
 	// Module to which all generated code is output to
 	llvm::Module* m_module;
 
-	// Execution engine from JIT instance
-	llvm::ExecutionEngine* m_engine{};
+	// JIT compiler instance
+	jit_compiler* m_compiler{};
 
 	// Endianness, affects vector element numbering (TODO)
 	bool m_is_be;
@@ -3266,7 +3266,7 @@ protected:
 	// CUstomized transformation passes. Technically the intrinsics replacement belongs here.
 	std::vector<std::unique_ptr<translator_pass>> m_transform_passes;
 
-	void initialize(llvm::LLVMContext& context, llvm::ExecutionEngine& engine);
+	void initialize(llvm::LLVMContext& context, jit_compiler& compiler);
 
 	// Run intrinsics replacement pass
 	void replace_intrinsics(llvm::Function&);
@@ -3334,7 +3334,7 @@ public:
 #ifdef _WIN32
 		func->setCallingConv(llvm::CallingConv::Win64);
 #endif
-		m_engine->updateGlobalMapping({lame.data(), lame.size()}, reinterpret_cast<uptr>(_func));
+		m_compiler->update_global_mapping({lame.data(), lame.size()}, reinterpret_cast<uptr>(_func));
 
 		const auto inst = m_ir->CreateCall(func, {args...});
 		inst->setTailCallKind(llvm::CallInst::TCK_NoTail);

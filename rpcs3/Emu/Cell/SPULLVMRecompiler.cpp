@@ -306,7 +306,7 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
 
 			// Register under a unique linkable name
 			const std::string ppname = fmt::format("%s-pp-%u", m_hash, m_pp_id++);
-			m_engine->updateGlobalMapping(ppname, reinterpret_cast<u64>(m_spurt->make_branch_patchpoint()));
+			m_compiler->update_global_mapping(ppname, reinterpret_cast<u64>(m_spurt->make_branch_patchpoint()));
 
 			// Create function with not exactly correct type
 			const auto ppfunc = llvm::cast<llvm::Function>(m_module->getOrInsertFunction(ppname, m_finfo->chunk->getFunctionType()).getCallee());
@@ -1567,7 +1567,7 @@ public:
 		if (!m_spurt)
 		{
 			m_spurt = &g_fxo->get<spu_runtime>();
-			cpu_translator::initialize(m_jit.get_context(), m_jit.get_engine());
+			cpu_translator::initialize(m_jit.get_context(), m_jit);
 
 			const auto md_name = llvm::MDString::get(m_context, "branch_weights");
 			const auto md_low = llvm::ValueAsMetadata::get(llvm::ConstantInt::get(GetType<u32>(), 1));
@@ -1729,7 +1729,7 @@ public:
 
 		using namespace llvm;
 
-		m_engine->clearAllGlobalMappings();
+		m_compiler->clear_global_mapping();
 
 		// Create LLVM module
 		std::unique_ptr<Module> _module = std::make_unique<Module>(m_hash + ".obj", m_context);
@@ -1738,7 +1738,7 @@ public:
 #else
 		_module->setTargetTriple(jit_compiler::triple2());
 #endif
-		_module->setDataLayout(m_jit.get_engine().getTargetMachine()->createDataLayout());
+		_module->setDataLayout(m_jit.get_data_layout());
 		m_module = _module.get();
 
 		// Initialize IR Builder
@@ -2435,7 +2435,7 @@ public:
 		entry_call->setCallingConv(entry_chunk->chunk->getCallingConv());
 
 		const auto dispatcher = llvm::cast<llvm::Function>(m_module->getOrInsertFunction("spu_dispatcher", main_func->getType()).getCallee());
-		m_engine->updateGlobalMapping("spu_dispatcher", reinterpret_cast<u64>(spu_runtime::tr_all));
+		m_compiler->update_global_mapping("spu_dispatcher", reinterpret_cast<u64>(spu_runtime::tr_all));
 		dispatcher->setCallingConv(main_func->getCallingConv());
 
 		// Proceed to the next code
@@ -3776,7 +3776,7 @@ public:
 					if (false && g_cfg.core.spu_verification)
 					{
 						const std::string ppname = fmt::format("%s-chunkpp-0x%05x", m_hash, i);
-						m_engine->updateGlobalMapping(ppname, reinterpret_cast<u64>(m_spurt->make_branch_patchpoint(i / 4)));
+						m_compiler->update_global_mapping(ppname, reinterpret_cast<u64>(m_spurt->make_branch_patchpoint(i / 4)));
 
 						const auto ppfunc = llvm::cast<llvm::Function>(m_module->getOrInsertFunction(ppname, m_finfo->chunk->getFunctionType()).getCallee());
 						ppfunc->setCallingConv(m_finfo->chunk->getCallingConv());
@@ -3950,7 +3950,7 @@ public:
 		}
 
 		// Register function pointer
-		const spu_function_t fn = reinterpret_cast<spu_function_t>(m_jit.get_engine().getPointerToFunction(main_func));
+		const spu_function_t fn = reinterpret_cast<spu_function_t>(m_jit.get(main_func->getName().str()));
 
 		// Install unconditionally, possibly replacing existing one from spu_fast
 		add_loc->compiled = fn;
@@ -4035,7 +4035,7 @@ public:
 	{
 		using namespace llvm;
 
-		m_engine->clearAllGlobalMappings();
+		m_compiler->clear_global_mapping();
 
 		// Create LLVM module
 		std::unique_ptr<Module> _module = std::make_unique<Module>("spu_interpreter.obj", m_context);
@@ -4044,7 +4044,7 @@ public:
 #else
 		_module->setTargetTriple(jit_compiler::triple2());
 #endif
-		_module->setDataLayout(m_jit.get_engine().getTargetMachine()->createDataLayout());
+		_module->setDataLayout(m_jit.get_data_layout());
 		m_module = _module.get();
 
 		// Initialize IR Builder
@@ -4407,12 +4407,12 @@ public:
 		m_jit.fin();
 
 		// Register interpreter entry point
-		spu_runtime::g_interpreter = reinterpret_cast<spu_function_t>(m_jit.get_engine().getPointerToFunction(main_func));
+		spu_runtime::g_interpreter = reinterpret_cast<spu_function_t>(m_jit.get(main_func->getName().str()));
 
 		for (u32 i = 0; i < spu_runtime::g_interpreter_table.size(); i++)
 		{
 			// Fill exported interpreter table
-			spu_runtime::g_interpreter_table[i] = ifuncs[i] ? reinterpret_cast<u64>(m_jit.get_engine().getPointerToFunction(ifuncs[i])) : 0;
+			spu_runtime::g_interpreter_table[i] = ifuncs[i] ? m_jit.get(ifuncs[i]->getName().str()) : 0;
 		}
 
 		if (!spu_runtime::g_interpreter)
@@ -10268,9 +10268,12 @@ public:
 
 	llvm::Value* get_segment_base()
 	{
+		// The mapped address differs between modules, so the name must be unique per module
+		// (symbols resolved by the JIT stay defined, unlike MCJIT's replaceable global mappings)
+		const std::string name = fmt::format("%s.segbase", m_module->getName().str());
 		const auto type = llvm::FunctionType::get(get_type<void>(), {}, false);
-		const auto func = llvm::cast<llvm::Function>(m_module->getOrInsertFunction("spu_segment_base", type).getCallee());
-		m_engine->updateGlobalMapping("spu_segment_base", reinterpret_cast<u64>(jit_runtime::alloc(0, 0)));
+		const auto func = llvm::cast<llvm::Function>(m_module->getOrInsertFunction(name, type).getCallee());
+		m_compiler->update_global_mapping(name, reinterpret_cast<u64>(jit_runtime::alloc(0, 0)));
 		return func;
 	}
 

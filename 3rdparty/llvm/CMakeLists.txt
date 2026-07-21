@@ -98,7 +98,8 @@ if(WITH_LLVM)
 			${LLVM_ADDITIONAL_LIBS}
 			Core
 			ExecutionEngine
-			MCJIT
+			OrcJIT
+			JITLink
 			Passes
 		)
 	else()

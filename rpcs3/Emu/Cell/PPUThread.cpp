@@ -5591,10 +5591,10 @@ static void ppu_initialize2(jit_compiler& jit, const ppu_module<lv2_obj>& module
 #else
 	_module->setTargetTriple(jit_compiler::triple1());
 #endif
-	_module->setDataLayout(jit.get_engine().getTargetMachine()->createDataLayout());
+	_module->setDataLayout(jit.get_data_layout());
 
 	// Initialize translator
-	PPUTranslator translator(jit.get_context(), _module.get(), module_part, jit.get_engine());
+	PPUTranslator translator(jit.get_context(), _module.get(), module_part, jit);
 
 	// Define some types
 	const auto _func = FunctionType::get(translator.get_type<void>(), {
