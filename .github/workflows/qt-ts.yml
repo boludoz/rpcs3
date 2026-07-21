@@ -10,6 +10,8 @@ on:
 
 jobs:
   Generate_Translation_Template:
+    # Only run on the main repo (not forks), except when manually dispatched
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'RPCS3/rpcs3'
     name: Generate Translation Template
     runs-on: ubuntu-24.04
     steps:

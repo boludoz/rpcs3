@@ -7,6 +7,9 @@
 #define VK_USE_PLATFORM_METAL_EXT
 #elif defined(ANDROID)
 #define VK_USE_PLATFORM_ANDROID_KHR
+// Entry points are runtime-resolved pointer variables (VKDynamicSymbols.h)
+// so a custom GPU driver can be injected - see _rpcsx_setCustomDriver.
+#define VK_NO_PROTOTYPES
 #else
 #if defined(HAVE_X11)
  #define VK_USE_PLATFORM_XLIB_KHR
@@ -33,6 +36,10 @@
 #undef VK_USE_PLATFORM_ANDROID_KHR
 #undef VK_USE_PLATFORM_XLIB_KHR
 #undef VK_USE_PLATFORM_WAYLAND_KHR
+
+#ifdef ANDROID
+#include "VKDynamicSymbols.h"
+#endif
 
 #include <util/types.hpp>
 

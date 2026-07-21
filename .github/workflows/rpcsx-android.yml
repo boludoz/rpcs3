@@ -1,0 +1,102 @@
+name: Build RPCSX Android
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: rpcsx-android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: "29.0.13113456"
+  CMAKE_VERSION: "3.31.6"
+
+jobs:
+  build-android:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - armv8-a
+          - armv8.1-a
+          - armv8.2-a
+          - armv8.4-a
+          - armv8.5-a
+          - armv9-a
+          - armv9.1-a
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: android-arm64-v8a-${{ matrix.arch }}-ccache
+          max-size: "500M"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: yes | sdkmanager "cmake;${{ env.CMAKE_VERSION }}" "ndk;${{ env.NDK_VERSION }}"
+
+      - name: Compute Gradle variant and release tag
+        id: meta
+        run: |
+          # Flavor names in android/build.gradle.kts are the -march value with
+          # '.' and '-' replaced by '_', prefixed with "arch":
+          #   armv8.1-a -> archarmv8_1_a -> assembleArcharmv8_1_aRelease
+          flavor="arch$(echo '${{ matrix.arch }}' | tr '.-' '__')"
+          echo "task=assemble${flavor^}Release" >> "$GITHUB_OUTPUT"
+          echo "tag=v$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          chmod +x gradlew
+          ./gradlew ":android:${{ steps.meta.outputs.task }}" \
+            -Prpcs3.ccache=true --console=plain
+
+      - name: Strip
+        run: |
+          "$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            "dist/librpcsx-android-arm64-v8a-${{ matrix.arch }}.so"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: librpcsx-android-arm64-v8a-${{ matrix.arch }}
+          path: dist/librpcsx-android-arm64-v8a-${{ matrix.arch }}.so
+          if-no-files-found: error
+
+      # Same asset naming and tag scheme as rpcsx (v<yyyymmdd>-<short sha>),
+      # which is what rpcsx-ui-android's RpcsxUpdater downloads:
+      #   librpcsx-android-<abi>-<arch>.so
+      - name: Deploy build
+        uses: softprops/action-gh-release@v2
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        with:
+          prerelease: false
+          make_latest: true
+          tag_name: ${{ steps.meta.outputs.tag }}
+          files: dist/librpcsx-android-arm64-v8a-${{ matrix.arch }}.so
+          body: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
