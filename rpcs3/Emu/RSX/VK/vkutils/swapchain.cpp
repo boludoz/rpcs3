@@ -146,7 +146,7 @@ namespace vk
 		}
 	}
 
-	std::pair<VkSurfaceCapabilitiesKHR, bool> swapchain_WSI::init_surface_capabilities()
+	std::optional<std::pair<VkSurfaceCapabilitiesKHR, bool>> swapchain_WSI::init_surface_capabilities()
 	{
 #ifdef _WIN32
 		if (g_cfg.video.vk.exclusive_fullscreen_mode != vk_exclusive_fs_mode::unspecified && dev.get_surface_capabilities_2_support())
@@ -178,7 +178,7 @@ namespace vk
 				ensure(getPhysicalDeviceSurfaceCapabilities2KHR);
 				CHECK_RESULT(getPhysicalDeviceSurfaceCapabilities2KHR(dev.gpu(), &pSurfaceInfo, &pSurfaceCapabilities));
 
-				return { pSurfaceCapabilities.surfaceCapabilities, !!full_screen_exclusive_capabilities.fullScreenExclusiveSupported };
+				return std::make_pair(pSurfaceCapabilities.surfaceCapabilities, !!full_screen_exclusive_capabilities.fullScreenExclusiveSupported);
 			}
 			else
 			{
@@ -187,8 +187,15 @@ namespace vk
 		}
 #endif
 		VkSurfaceCapabilitiesKHR surface_descriptors = {};
-		CHECK_RESULT(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.gpu(), m_surface, &surface_descriptors));
-		return { surface_descriptors, false };
+		if (const VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.gpu(), m_surface, &surface_descriptors);
+			result != VK_SUCCESS)
+		{
+			// Can legitimately happen if the surface was lost between recreation and this query
+			// (e.g. Android app backgrounded again mid-reinit). Not fatal - the caller retries.
+			rsx_log.error("Swapchain: vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed (VkResult=%d)", static_cast<int>(result));
+			return std::nullopt;
+		}
+		return std::make_pair(surface_descriptors, false);
 	}
 
 	bool swapchain_WSI::init()
@@ -202,7 +209,14 @@ namespace vk
 		VkSwapchainKHR old_swapchain = m_vk_swapchain;
 		vk::physical_device& gpu = const_cast<vk::physical_device&>(dev.gpu());
 
-		auto [surface_descriptors, should_specify_exclusive_full_screen_mode] = init_surface_capabilities();
+		const auto surface_props = init_surface_capabilities();
+		if (!surface_props)
+		{
+			rsx_log.warning("Swapchain: could not query surface capabilities. Deferring swapchain initialization.");
+			return false;
+		}
+
+		auto [surface_descriptors, should_specify_exclusive_full_screen_mode] = *surface_props;
 
 		if (surface_descriptors.maxImageExtent.width < m_width ||
 			surface_descriptors.maxImageExtent.height < m_height)
@@ -226,10 +240,18 @@ namespace vk
 		}
 
 		u32 nb_available_modes = 0;
-		CHECK_RESULT(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, nullptr));
+		if (vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, nullptr) != VK_SUCCESS || !nb_available_modes)
+		{
+			rsx_log.warning("Swapchain: could not query surface present modes. Deferring swapchain initialization.");
+			return false;
+		}
 
 		std::vector<VkPresentModeKHR> present_modes(nb_available_modes);
-		CHECK_RESULT(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, present_modes.data()));
+		if (vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, present_modes.data()) != VK_SUCCESS)
+		{
+			rsx_log.warning("Swapchain: could not query surface present modes. Deferring swapchain initialization.");
+			return false;
+		}
 
 		VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 		std::vector<VkPresentModeKHR> preferred_modes;
@@ -323,7 +345,14 @@ namespace vk
 		rsx_log.notice("Swapchain: requesting full screen exclusive mode %d.", static_cast<int>(full_screen_exclusive_info.fullScreenExclusive));
 #endif
 
-		_vkCreateSwapchainKHR(dev, &swap_info, nullptr, &m_vk_swapchain);
+		const VkResult create_result = _vkCreateSwapchainKHR(dev, &swap_info, nullptr, &m_vk_swapchain);
+		if (create_result != VK_SUCCESS)
+		{
+			// e.g. VK_ERROR_NATIVE_WINDOW_IN_USE_KHR or VK_ERROR_SURFACE_LOST_KHR on Android.
+			// Leave no dangling handle behind; the caller will retry with a clean slate.
+			rsx_log.error("Swapchain: vkCreateSwapchainKHR failed (VkResult=%d)", static_cast<int>(create_result));
+			m_vk_swapchain = VK_NULL_HANDLE;
+		}
 
 		if (old_swapchain)
 		{
@@ -333,6 +362,11 @@ namespace vk
 			}
 
 			_vkDestroySwapchainKHR(dev, old_swapchain, nullptr);
+		}
+
+		if (create_result != VK_SUCCESS)
+		{
+			return false;
 		}
 
 		init_swapchain_images(dev);

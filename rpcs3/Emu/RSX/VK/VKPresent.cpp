@@ -94,13 +94,28 @@ bool VKGSRender::reinitialize_swapchain()
 	m_frame_context_storage.clear();
 
 #ifdef ANDROID
-	// The underlying ANativeWindow may have been replaced after the surface was
-	// destroyed and recreated (e.g. app sent to background and back). The old
-	// VkSurface is now invalid, so recreate it from the current window handle.
+	// The underlying ANativeWindow is replaced every time the app goes to the
+	// background and returns. The old VkSurface - and the swapchain created from
+	// it - are unusable at that point, so tear both down in spec order and
+	// rebuild the surface from the current window handle.
 	{
+		// Blocks until a window is available again (i.e. app is foregrounded).
 		display_handle_t display = m_frame->handle();
-		VkSurfaceKHR new_surface = m_instance.recreate_surface(display);
-		m_swapchain->update_wsi_surface(new_surface);
+
+		if (Emu.IsStopped())
+		{
+			// Unblocked by shutdown; the returned handle may be a stale window.
+			swapchain_unavailable = true;
+			return false;
+		}
+
+		m_instance.recreate_surface(display, m_swapchain.get());
+
+		// The replacement window can have different dimensions (rotation, DeX,
+		// resizable activity), and client_width/height were cached from the old
+		// window before m_frame->handle() refreshed them.
+		m_swapchain_dims.width = m_frame->client_width();
+		m_swapchain_dims.height = m_frame->client_height();
 	}
 #endif
 
@@ -620,10 +635,16 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			should_reinitialize_swapchain = true;
 			break;
 		case VK_ERROR_OUT_OF_DATE_KHR:
-			rsx_log.warning("vkAcquireNextImageKHR failed with VK_ERROR_OUT_OF_DATE_KHR. Flip request ignored until surface is recreated.");
+#ifdef ANDROID
+		// Android drivers (Adreno, Mali) report VK_ERROR_SURFACE_LOST_KHR instead of
+		// OUT_OF_DATE when the ANativeWindow backing the surface has been destroyed.
+		// Recoverable: reinitialize_swapchain() rebuilds the surface from the new window.
+		case VK_ERROR_SURFACE_LOST_KHR:
+#endif
+			rsx_log.warning("vkAcquireNextImageKHR failed with error code %lld. Flip request ignored until surface is recreated.", static_cast<s64>(status));
 			swapchain_unavailable = true;
 			reinitialize_swapchain();
-			ensure(m_current_frame, "Could not reinitialize swapchain after VK_ERROR_OUT_OF_DATE_KHR signal!");
+			ensure(m_current_frame, "Could not reinitialize swapchain after surface loss signal!");
 			continue;
 		default:
 			vk::die_with_error(status);

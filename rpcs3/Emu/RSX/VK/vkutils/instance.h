@@ -61,6 +61,6 @@ namespace vk
 
 		swapchain_base* create_swapchain(display_handle_t window_handle, vk::physical_device& dev);
 
-		VkSurfaceKHR recreate_surface(display_handle_t window_handle);
+		VkSurfaceKHR recreate_surface(display_handle_t window_handle, swapchain_base* swapchain);
 	};
 }

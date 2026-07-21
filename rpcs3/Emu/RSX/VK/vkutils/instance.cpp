@@ -379,8 +379,15 @@ namespace vk
 		return new swapchain_WSI(dev, present_queue_idx, graphics_queue_idx, transfer_queue_idx, format, m_surface, color_space, !surface_config.supports_automatic_wm_reports);
 	}
 
-	VkSurfaceKHR instance::recreate_surface(display_handle_t window_handle)
+	VkSurfaceKHR instance::recreate_surface(display_handle_t window_handle, swapchain_base* swapchain)
 	{
+		// Strict ordering: the swapchain must be destroyed before the surface it
+		// was created from, and only then can the surface itself be replaced.
+		if (swapchain)
+		{
+			swapchain->retire_swapchain();
+		}
+
 		if (m_surface)
 		{
 			vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
@@ -392,6 +399,12 @@ namespace vk
 			.supports_automatic_wm_reports = true
 		};
 		m_surface = make_WSI_surface(m_instance, window_handle, &surface_config);
+
+		if (swapchain)
+		{
+			swapchain->update_wsi_surface(m_surface);
+		}
+
 		return m_surface;
 	}
 }

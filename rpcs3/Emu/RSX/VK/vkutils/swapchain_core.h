@@ -9,6 +9,7 @@
 #include "image.h"
 
 #include <memory>
+#include <optional>
 
 namespace vk
 {
@@ -69,6 +70,14 @@ namespace vk
 		}
 
 		virtual void update_wsi_surface(VkSurfaceKHR) {}
+
+		// Destroys the underlying VkSwapchainKHR without releasing the render
+		// device. Must be invoked before the WSI surface itself is destroyed:
+		// a swapchain can never outlive the surface it was created from
+		// (VUID-vkDestroySurfaceKHR-surface-01266), and a replacement swapchain
+		// cannot chain oldSwapchain across two different native windows
+		// (VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933).
+		virtual void retire_swapchain() {}
 
 		bool init(u32 w, u32 h)
 		{
@@ -191,7 +200,7 @@ namespace vk
 
 		void destroy(bool = true) override;
 
-		std::pair<VkSurfaceCapabilitiesKHR, bool> init_surface_capabilities();
+		std::optional<std::pair<VkSurfaceCapabilitiesKHR, bool>> init_surface_capabilities();
 
 		using WSI_swapchain_base::init;
 		bool init() override;
@@ -204,6 +213,16 @@ namespace vk
 		void update_wsi_surface(VkSurfaceKHR surface) override
 		{
 			m_surface = surface;
+		}
+
+		void retire_swapchain() override
+		{
+			if (m_vk_swapchain)
+			{
+				swapchain_images.clear();
+				_vkDestroySwapchainKHR(dev, m_vk_swapchain, nullptr);
+				m_vk_swapchain = VK_NULL_HANDLE;
+			}
 		}
 
 		VkResult acquire_next_swapchain_image(VkSemaphore semaphore, u64 timeout, u32* result) override
