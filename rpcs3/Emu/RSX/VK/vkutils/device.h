@@ -39,6 +39,7 @@ namespace vk
 		u64 device_local_total_bytes;
 		u64 host_visible_total_bytes;
 		u64 device_bar_total_bytes;
+		bool unified_memory = false;
 	};
 
 	struct descriptor_indexing_features

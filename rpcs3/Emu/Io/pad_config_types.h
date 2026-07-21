@@ -21,6 +21,9 @@ enum class pad_handler
 #ifdef HAVE_LIBEVDEV
 	evdev,
 #endif
+#ifdef ANDROID
+	virtual_pad,
+#endif
 };
 
 enum class mouse_movement_mode : s32

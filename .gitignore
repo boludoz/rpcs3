@@ -126,3 +126,10 @@ CMakeUserPresets.json
 
 .cache/
 .lldbinit
+
+# Android port (Gradle)
+.gradle/
+local.properties
+/dist/
+android/.cxx/
+android/build/
