@@ -2373,7 +2373,10 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	}
 
 	// Initialize HLE modules
-	ppu_initialize_modules(&link, ar);
+	if (!virtual_load)
+	{
+		ppu_initialize_modules(&link, ar);
+	}
 
 	// Embedded SPU elf patching
 	for (const auto& seg : _main.segs)

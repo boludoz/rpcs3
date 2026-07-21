@@ -347,6 +347,7 @@ namespace utils
 	{
 		if (!codec) return false;
 
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
 		const void* sample_formats = nullptr;
 		int num = 0;
 
@@ -367,6 +368,16 @@ namespace utils
 				return true;
 			}
 		}
+#else
+		// ffmpeg < 7.1: avcodec_get_supported_config doesn't exist yet
+		for (const AVSampleFormat* fmt = codec->sample_fmts; fmt && *fmt != AV_SAMPLE_FMT_NONE; fmt++)
+		{
+			if (*fmt == sample_fmt)
+			{
+				return true;
+			}
+		}
+#endif
 		return false;
 	}
 
@@ -378,6 +389,7 @@ namespace utils
 		if (!codec)
 			return default_sample_rate;
 
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
 		const void* sample_rates = nullptr;
 		int num = 0;
 
@@ -399,6 +411,20 @@ namespace utils
 				best_sample_rate = *sample_rate;
 			}
 		}
+#else
+		// ffmpeg < 7.1: avcodec_get_supported_config doesn't exist yet
+		if (!codec->supported_samplerates)
+			return default_sample_rate;
+
+		int best_sample_rate = 0;
+		for (const int* sample_rate = codec->supported_samplerates; sample_rate && *sample_rate != 0; sample_rate++)
+		{
+			if (!best_sample_rate || abs(default_sample_rate - *sample_rate) < abs(default_sample_rate - best_sample_rate))
+			{
+				best_sample_rate = *sample_rate;
+			}
+		}
+#endif
 		return best_sample_rate;
 	}
 
@@ -425,6 +451,7 @@ namespace utils
 	{
 		if (!codec) return nullptr;
 
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
 		const void* ch_layouts = nullptr;
 		int num = 0;
 
@@ -436,6 +463,14 @@ namespace utils
 
 		if (!ch_layouts)
 			return nullptr;
+#else
+		// ffmpeg < 7.1: avcodec_get_supported_config doesn't exist yet
+		const AVChannelLayout* ch_layouts = codec->ch_layouts;
+		const int num = INT_MAX;
+
+		if (!ch_layouts)
+			return nullptr;
+#endif
 
 		const AVChannelLayout preferred_ch_layout = get_preferred_channel_layout(channels);
 		const AVChannelLayout* found_ch_layout = nullptr;
@@ -580,7 +615,7 @@ namespace utils
 			}
 
 			const int dst_channels = 2;
-			const AVChannelLayout dst_channel_layout = AV_CHANNEL_LAYOUT_STEREO;
+			AVChannelLayout dst_channel_layout = AV_CHANNEL_LAYOUT_STEREO;
 			const AVSampleFormat dst_format = AV_SAMPLE_FMT_FLT;
 
 			const int set_err = swr_alloc_set_opts2(&av.swr, &dst_channel_layout, dst_format,

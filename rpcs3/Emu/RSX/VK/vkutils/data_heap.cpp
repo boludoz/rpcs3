@@ -22,24 +22,29 @@ namespace vk
 		ensure(std::popcount(flags & (heap_pool_force_vram_shadow | heap_pool_low_latency)) <= 1,
 			"Invalid data heap flag combination detected");
 
-		if ((flags & heap_pool_low_latency) && g_cfg.video.vk.use_rebar_upload_heap)
+		if (((flags & heap_pool_low_latency) && g_cfg.video.vk.use_rebar_upload_heap) || memory_map.unified_memory)
 		{
-			// Prefer uploading to BAR if low latency is desired.
+			// Prefer uploading to BAR if low latency is desired or when using unified memory architecture.
 			const int max_usage = memory_map.device_bar_total_bytes <= (256 * 0x100000) ? 75 : 90;
 			m_prefer_writethrough = can_allocate_heap(memory_map.device_bar, size, max_usage);
 
 			// Log it
 			if (m_prefer_writethrough)
 			{
-				rsx_log.notice("Data heap %s will attempt to use Re-BAR memory", m_name);
+				rsx_log.notice("Data heap %s will attempt to use Re-BAR/unified memory", m_name);
 			}
 			else
 			{
-				rsx_log.warning("Could not fit heap '%s' into Re-BAR memory", m_name);
+				rsx_log.warning("Could not fit heap '%s' into Re-BAR/unified memory", m_name);
 			}
 		}
 
 		VkFlags memory_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		if (m_prefer_writethrough && memory_map.unified_memory)
+		{
+			memory_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		}
+
 		auto memory_index = m_prefer_writethrough ? memory_map.device_bar : memory_map.host_visible_coherent;
 
 		const bool vram_shadow_requested = !!(flags & heap_pool_force_vram_shadow);

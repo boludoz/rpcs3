@@ -15,7 +15,13 @@ namespace rsx
 		{
 			if (audio_path.empty()) return;
 
-			m_video_source = ensure(Emu.GetCallbacks().make_video_source());
+			if (auto make_video_source = Emu.GetCallbacks().make_video_source)
+			{
+				m_video_source = make_video_source();
+			}
+
+			if (!m_video_source) return;
+
 			m_video_source->set_audio_path(audio_path);
 		}
 
