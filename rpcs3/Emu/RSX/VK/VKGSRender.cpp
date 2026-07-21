@@ -734,10 +734,18 @@ VKGSRender::VKGSRender(utils::serial* ar) noexcept : GSRender(ar)
 			backend_config.supports_passthrough_dma = false;
 		}
 		break;
-	case vk::driver_vendor::TURNIP:
 	case vk::driver_vendor::QUALCOMM_ADRENO:
+		rsx_log.notice("Configuring optimizations and workarounds for Qualcomm Adreno driver");
+		backend_config.supports_passthrough_dma = false;
+		if (!g_cfg.video.write_color_buffers)
+		{
+			rsx_log.notice("Enabling Write Color Buffers automatically for Qualcomm Adreno driver");
+			g_cfg.video.write_color_buffers.set(true);
+		}
+		break;
+	case vk::driver_vendor::TURNIP:
 	case vk::driver_vendor::ARM_MALI:
-		rsx_log.notice("Configuring optimizations for tile-based mobile GPU driver (Turnip/Adreno/Mali)");
+		rsx_log.notice("Configuring optimizations for tile-based mobile GPU driver (Turnip/Mali)");
 		backend_config.supports_passthrough_dma = false;
 		break;
 	default: break;

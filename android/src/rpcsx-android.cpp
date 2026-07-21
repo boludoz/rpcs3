@@ -180,7 +180,9 @@ struct GraphicsFrame : GSFrameBase {
       }
 
       activeNativeWindow = result;
+    }
 
+    if (result != nullptr) {
       width = ANativeWindow_getWidth(result);
       height = ANativeWindow_getHeight(result);
     }
@@ -199,8 +201,18 @@ struct GraphicsFrame : GSFrameBase {
   draw_context_t make_context() override { return nullptr; }
   void set_current(draw_context_t ctx) override {}
   void flip(draw_context_t ctx, bool skip_frame = false) override {}
-  int client_width() override { return width; }
-  int client_height() override { return height; }
+  int client_width() override {
+    if (auto win = getNativeWindow()) {
+      width = ANativeWindow_getWidth(win);
+    }
+    return width;
+  }
+  int client_height() override {
+    if (auto win = getNativeWindow()) {
+      height = ANativeWindow_getHeight(win);
+    }
+    return height;
+  }
   f64 client_display_rate() override { return 120.0f; }
   bool has_alpha() override {
     return ANativeWindow_getFormat(getNativeWindow()) ==
@@ -2728,33 +2740,20 @@ static void collectIsoInfo(JNIEnv *env, jlong progressId,
 //     -> /storage/1234-5678/PS3
 // Returns an empty string if the URI is not a resolvable local-storage tree
 // (cloud providers, USB OTG document providers, etc.).
-static std::string resolveTreeUriToPath(std::string_view uri) {
-  std::size_t authorityPos = uri.find("com.android.externalstorage.documents/tree/");
-  std::size_t markerLen = sizeof("com.android.externalstorage.documents/tree/") - 1;
-  if (authorityPos == std::string_view::npos) {
-    authorityPos = uri.find("com.android.externalstorage.documents/document/");
-    markerLen = sizeof("com.android.externalstorage.documents/document/") - 1;
-  }
-  if (authorityPos == std::string_view::npos) {
-    return {};
-  }
-
-  auto encodedId = uri.substr(authorityPos + markerLen);
-
-  // Percent-decode the document id (it is "<volume>:<relative path>").
+static std::string percentDecode(std::string_view input) {
   std::string decoded;
-  decoded.reserve(encodedId.size());
-  for (std::size_t i = 0; i < encodedId.size(); ++i) {
-    char c = encodedId[i];
-    if (c == '%' && i + 2 < encodedId.size()) {
+  decoded.reserve(input.size());
+  for (std::size_t i = 0; i < input.size(); ++i) {
+    char c = input[i];
+    if (c == '%' && i + 2 < input.size()) {
       auto hexToNibble = [](char h) -> int {
         if (h >= '0' && h <= '9') return h - '0';
         if (h >= 'a' && h <= 'f') return h - 'a' + 10;
         if (h >= 'A' && h <= 'F') return h - 'A' + 10;
         return -1;
       };
-      int hi = hexToNibble(encodedId[i + 1]);
-      int lo = hexToNibble(encodedId[i + 2]);
+      int hi = hexToNibble(input[i + 1]);
+      int lo = hexToNibble(input[i + 2]);
       if (hi >= 0 && lo >= 0) {
         decoded.push_back(static_cast<char>((hi << 4) | lo));
         i += 2;
@@ -2763,31 +2762,130 @@ static std::string resolveTreeUriToPath(std::string_view uri) {
     }
     decoded.push_back(c);
   }
+  return decoded;
+}
 
-  auto colonPos = decoded.find(':');
-  if (colonPos == std::string::npos) {
-    return {};
+static std::string getPrimaryStoragePath(JNIEnv *env) {
+  if (env) {
+    if (jclass envClass = env->FindClass("android/os/Environment")) {
+      if (jmethodID getExtDir = env->GetStaticMethodID(envClass, "getExternalStorageDirectory", "()Ljava/io/File;")) {
+        if (jobject fileObj = env->CallStaticObjectMethod(envClass, getExtDir)) {
+          if (jclass fileClass = env->FindClass("java/io/File")) {
+            if (jmethodID getAbsPath = env->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;")) {
+              if (jstring pathStr = static_cast<jstring>(env->CallObjectMethod(fileObj, getAbsPath))) {
+                const char *chars = env->GetStringUTFChars(pathStr, nullptr);
+                std::string path = chars ? chars : "";
+                if (chars) env->ReleaseStringUTFChars(pathStr, chars);
+                if (!path.empty()) return path;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return "/storage/emulated/0";
+}
+
+static std::string getDownloadsDirectoryPath(JNIEnv *env) {
+  if (env) {
+    if (jclass envClass = env->FindClass("android/os/Environment")) {
+      if (jfieldID dirDownloadsField = env->GetStaticFieldID(envClass, "DIRECTORY_DOWNLOADS", "Ljava/lang/String;")) {
+        if (jstring downloadsType = static_cast<jstring>(env->GetStaticObjectField(envClass, dirDownloadsField))) {
+          if (jmethodID getExtPubDir = env->GetStaticMethodID(envClass, "getExternalStoragePublicDirectory", "(Ljava/lang/String;)Ljava/io/File;")) {
+            if (jobject fileObj = env->CallStaticObjectMethod(envClass, getExtPubDir, downloadsType)) {
+              if (jclass fileClass = env->FindClass("java/io/File")) {
+                if (jmethodID getAbsPath = env->GetMethodID(fileClass, "getAbsolutePath", "()Ljava/lang/String;")) {
+                  if (jstring pathStr = static_cast<jstring>(env->CallObjectMethod(fileObj, getAbsPath))) {
+                    const char *chars = env->GetStringUTFChars(pathStr, nullptr);
+                    std::string path = chars ? chars : "";
+                    if (chars) env->ReleaseStringUTFChars(pathStr, chars);
+                    if (!path.empty()) return path;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return getPrimaryStoragePath(env) + "/Download";
+}
+
+static std::string resolveTreeUriToPath(JNIEnv *env, std::string_view uri) {
+  const std::string fullDecoded = percentDecode(uri);
+
+  // 1. Check if the percent-decoded URI contains a direct /storage/ path
+  auto storagePos = fullDecoded.find("/storage/");
+  if (storagePos != std::string::npos) {
+    std::string path = fullDecoded.substr(storagePos);
+    auto queryPos = path.find_first_of("?#");
+    if (queryPos != std::string::npos) path.resize(queryPos);
+    if (path.size() > 1 && path.back() == '/') path.pop_back();
+    return path;
   }
 
-  const std::string volume = decoded.substr(0, colonPos);
-  std::string relative = decoded.substr(colonPos + 1);
-
-  std::string base;
-  if (volume == "primary") {
-    base = "/storage/emulated/0/";
-  } else if (!volume.empty()) {
-    base = "/storage/" + volume + "/";
-  } else {
-    return {};
+  // 2. Check for com.android.externalstorage.documents (tree or document)
+  std::size_t authorityPos = uri.find("com.android.externalstorage.documents/tree/");
+  std::size_t markerLen = sizeof("com.android.externalstorage.documents/tree/") - 1;
+  if (authorityPos == std::string_view::npos) {
+    authorityPos = uri.find("com.android.externalstorage.documents/document/");
+    markerLen = sizeof("com.android.externalstorage.documents/document/") - 1;
   }
 
-  if (!relative.empty()) {
-    base += relative;
-  } else {
-    base.pop_back();
+  if (authorityPos != std::string_view::npos) {
+    auto encodedId = uri.substr(authorityPos + markerLen);
+    std::string decodedId = percentDecode(encodedId);
+
+    auto rawPos = decodedId.find("/storage/");
+    if (rawPos != std::string::npos) {
+      std::string path = decodedId.substr(rawPos);
+      if (path.size() > 1 && path.back() == '/') path.pop_back();
+      return path;
+    }
+
+    auto colonPos = decodedId.find(':');
+    if (colonPos != std::string::npos) {
+      const std::string volume = decodedId.substr(0, colonPos);
+      std::string relative = decodedId.substr(colonPos + 1);
+
+      std::string base;
+      if (volume == "primary") {
+        base = getPrimaryStoragePath(env) + "/";
+      } else if (!volume.empty()) {
+        base = "/storage/" + volume + "/";
+      }
+
+      if (!base.empty()) {
+        if (!relative.empty()) {
+          base += relative;
+        } else if (base.back() == '/' && base.size() > 1) {
+          base.pop_back();
+        }
+        return base;
+      }
+    }
   }
 
-  return base;
+  // 3. Check for com.android.providers.downloads.documents
+  if (uri.find("com.android.providers.downloads.documents") != std::string_view::npos) {
+    const std::string downloadsDir = getDownloadsDirectoryPath(env);
+    if (fullDecoded.find("downloads") != std::string::npos) {
+      std::size_t docPos = fullDecoded.find("/document/");
+      if (docPos != std::string::npos) {
+        std::string sub = fullDecoded.substr(docPos + 10);
+        if (sub.rfind("raw:", 0) == 0) sub = sub.substr(4);
+        if (sub.rfind("/storage/", 0) == 0) return sub;
+        if (!sub.empty() && sub != "downloads") {
+          return downloadsDir + "/" + sub;
+        }
+      }
+      return downloadsDir;
+    }
+  }
+
+  return {};
 }
 
 // Exposes resolveTreeUriToPath to Kotlin so the UI never needs its own SAF
@@ -2795,7 +2893,7 @@ static std::string resolveTreeUriToPath(std::string_view uri) {
 // list when a managed directory is removed). Returns null if unresolvable.
 extern "C" jstring _rpcsx_resolveTreeUriToPath(JNIEnv *env,
                                                std::string_view treeUri) {
-  const std::string path = resolveTreeUriToPath(treeUri);
+  const std::string path = resolveTreeUriToPath(env, treeUri);
   if (path.empty()) {
     return nullptr;
   }
@@ -2811,13 +2909,23 @@ extern "C" jstring _rpcsx_resolveTreeUriToPath(JNIEnv *env,
 extern "C" bool _rpcsx_collectGameInfoFromUri(JNIEnv *env,
                                               std::string_view treeUri,
                                               long progressId) {
-  const std::string path = resolveTreeUriToPath(treeUri);
+  const std::string path = resolveTreeUriToPath(env, treeUri);
 
   if (path.empty()) {
     return false;
   }
 
   std::error_code ec;
+  if (std::filesystem::is_regular_file(path, ec)) {
+    auto ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (ext == ".iso") {
+      collectIsoInfo(env, progressId, path);
+      return true;
+    }
+    return false;
+  }
+
   if (!std::filesystem::is_directory(path, ec)) {
     return false;
   }
@@ -2844,13 +2952,18 @@ extern "C" bool _rpcsx_collectGameInfoFromUri(JNIEnv *env,
 extern "C" bool _rpcsx_collectIsoInfoFromUri(JNIEnv *env,
                                              std::string_view treeUri,
                                              long progressId) {
-  const std::string path = resolveTreeUriToPath(treeUri);
+  const std::string path = resolveTreeUriToPath(env, treeUri);
 
   if (path.empty()) {
     return false;
   }
 
   std::error_code ec;
+  if (std::filesystem::is_regular_file(path, ec)) {
+    collectIsoInfo(env, progressId, path);
+    return true;
+  }
+
   if (!std::filesystem::is_directory(path, ec)) {
     return false;
   }
