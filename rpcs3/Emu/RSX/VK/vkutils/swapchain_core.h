@@ -68,6 +68,8 @@ namespace vk
 			return false;
 		}
 
+		virtual void update_wsi_surface(VkSurfaceKHR) {}
+
 		bool init(u32 w, u32 h)
 		{
 			m_width = w;
@@ -197,6 +199,11 @@ namespace vk
 		bool supports_automatic_wm_reports() const override
 		{
 			return m_wm_reports_flag;
+		}
+
+		void update_wsi_surface(VkSurfaceKHR surface) override
+		{
+			m_surface = surface;
 		}
 
 		VkResult acquire_next_swapchain_image(VkSemaphore semaphore, u64 timeout, u32* result) override

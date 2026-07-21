@@ -93,6 +93,17 @@ bool VKGSRender::reinitialize_swapchain()
 	m_current_queue_index = 0;
 	m_frame_context_storage.clear();
 
+#ifdef ANDROID
+	// The underlying ANativeWindow may have been replaced after the surface was
+	// destroyed and recreated (e.g. app sent to background and back). The old
+	// VkSurface is now invalid, so recreate it from the current window handle.
+	{
+		display_handle_t display = m_frame->handle();
+		VkSurfaceKHR new_surface = m_instance.recreate_surface(display);
+		m_swapchain->update_wsi_surface(new_surface);
+	}
+#endif
+
 	// Rebuild swapchain. Old swapchain destruction is handled by the init_swapchain call
 	if (!m_swapchain->init(m_swapchain_dims.width, m_swapchain_dims.height))
 	{

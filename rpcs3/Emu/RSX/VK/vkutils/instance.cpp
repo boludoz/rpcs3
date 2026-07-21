@@ -378,4 +378,20 @@ namespace vk
 
 		return new swapchain_WSI(dev, present_queue_idx, graphics_queue_idx, transfer_queue_idx, format, m_surface, color_space, !surface_config.supports_automatic_wm_reports);
 	}
+
+	VkSurfaceKHR instance::recreate_surface(display_handle_t window_handle)
+	{
+		if (m_surface)
+		{
+			vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
+			m_surface = VK_NULL_HANDLE;
+		}
+
+		WSI_config surface_config
+		{
+			.supports_automatic_wm_reports = true
+		};
+		m_surface = make_WSI_surface(m_instance, window_handle, &surface_config);
+		return m_surface;
+	}
 }
