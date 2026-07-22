@@ -1271,7 +1271,10 @@ iso_file::iso_file(const std::string& path, bs_t<fs::open_mode> mode, const iso_
 		return;
 	}
 
-	m_file.seek(m_meta.extents[0].start * ISO_SECTOR_SIZE);
+	if (!m_meta.extents.empty())
+	{
+		m_file.seek(m_meta.extents[0].start * ISO_SECTOR_SIZE);
+	}
 
 	m_raw_device = fs::is_optical_raw_device(path);
 }
@@ -1287,7 +1290,10 @@ iso_file::iso_file(fs::file&& file)
 	}
 
 	m_meta.extents.push_back({0, m_file.size()});
-	m_file.seek(m_meta.extents[0].start * ISO_SECTOR_SIZE);
+	if (!m_meta.extents.empty())
+	{
+		m_file.seek(m_meta.extents[0].start * ISO_SECTOR_SIZE);
+	}
 
 	m_raw_device = false;
 }
@@ -1303,7 +1309,10 @@ iso_file::iso_file(fs::file&& file, const iso_fs_node& node)
 		return;
 	}
 
-	m_file.seek(m_meta.extents[0].start * ISO_SECTOR_SIZE);
+	if (!m_meta.extents.empty())
+	{
+		m_file.seek(m_meta.extents[0].start * ISO_SECTOR_SIZE);
+	}
 
 	m_raw_device = false;
 }
@@ -1330,7 +1339,10 @@ bool iso_file::trunc(u64 /*length*/)
 
 std::pair<u64, iso_extent_info> iso_file::get_extent_pos(u64 pos) const
 {
-	ensure(!m_meta.extents.empty());
+	if (m_meta.extents.empty())
+	{
+		return {0, iso_extent_info{}};
+	}
 
 	auto it = m_meta.extents.begin();
 
