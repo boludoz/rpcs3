@@ -289,7 +289,7 @@ static jstring wrap(JNIEnv *env, const char *string) {
   return env->NewStringUTF(string);
 }
 
-static std::string resolveTreeUriToPath(std::string_view uri);
+static std::string resolveTreeUriToPath(JNIEnv *env, std::string_view uri);
 
 static std::string fix_dir_path(std::string string) {
   if (!string.empty() && !string.ends_with('/')) {
@@ -626,6 +626,7 @@ struct GameInfo {
   std::string iconPath;
   int flags = 0;
   std::string sourceUri;
+  std::string version;
 };
 
 class Progress {
@@ -685,7 +686,8 @@ static void sendGameInfo(JNIEnv *env, jlong progressId,
 
   jmethodID gameConstructor = ensure(env->GetMethodID(
       gameClass, "<init>",
-      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;)V"));
+      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/"
+      "String;Ljava/lang/String;)V"));
 
   std::vector<jobject> objects;
   objects.reserve(infos.size());
@@ -700,7 +702,8 @@ static void sendGameInfo(JNIEnv *env, jlong progressId,
         gameClass, gameConstructor, wrap(env, path), wrap(env, info.name),
         wrap(env, Emu.GetCallbacks().resolve_path(info.iconPath)),
         jint(info.flags),
-        info.sourceUri.empty() ? nullptr : wrap(env, info.sourceUri)));
+        info.sourceUri.empty() ? nullptr : wrap(env, info.sourceUri),
+        info.version.empty() ? nullptr : wrap(env, info.version)));
   }
 
   auto result = env->NewObjectArray(objects.size(), gameClass, nullptr);
@@ -857,6 +860,10 @@ fetchGameInfo(const psf::registry &psf,
   auto name = std::string(psf::get_string(psf, "TITLE"));
   auto bootable = psf::get_integer(psf, "BOOTABLE", 0);
   auto category = psf::get_string(psf, "CATEGORY");
+  auto version = std::string(psf::get_string(psf, "APP_VER"));
+  if (version.empty()) {
+    version = std::string(psf::get_string(psf, "VERSION"));
+  }
 
   if (!bootable || titleId.empty()) {
     return {};
@@ -948,6 +955,7 @@ fetchGameInfo(const psf::registry &psf,
       .name = std::move(name),
       .iconPath = std::move(iconPath),
       .flags = flags,
+      .version = std::move(version),
   };
 }
 
@@ -1795,6 +1803,30 @@ extern "C" bool _rpcsx_multiPadData(int playerIndex, int digital1, int digital2,
 
 extern "C" int _rpcsx_getMaxVirtualPads() { return kMaxVirtualPads; }
 
+// Backend rumble: the game writes motor strength into the virtual pad's
+// vibrate motors (cellPadSetActDirect). The Android side has no rumble output
+// of its own, so it polls this and drives the physical controller / phone
+// vibrator. Returns (large << 8) | small, each 0-255; 0 when idle or no pad.
+extern "C" int _rpcsx_getPadVibration(int playerIndex) {
+  if (playerIndex < 0 || playerIndex >= kMaxVirtualPads) {
+    return 0;
+  }
+
+  std::shared_ptr<Pad> pad;
+  {
+    std::lock_guard lock(g_virtual_pad_mutex);
+    pad = g_virtual_pads[playerIndex];
+  }
+
+  if (pad == nullptr) {
+    return 0;
+  }
+
+  const int large = pad->m_vibrate_motors[0].value;
+  const int small = pad->m_vibrate_motors[1].value;
+  return ((large & 0xff) << 8) | (small & 0xff);
+}
+
 // Name of the first Vulkan physical device, or empty if Vulkan is unusable.
 // Emu.Init() requires a non-empty adapter name whenever the default renderer
 // is Vulkan (System.cpp ensure), so this must run before it.
@@ -2035,56 +2067,53 @@ extern "C" int _rpcsx_boot(std::string_view path_, std::string_view config_path_
   return result;
 }
 
-// Owner of the SAF fd backing the currently mounted ISO. The iso_device only
-// holds dup()s produced by its opener, so this original must stay open for
-// the whole session; it is replaced on the next fd boot.
-static std::atomic<int> g_boot_iso_fd{-1};
-
-static void close_boot_iso_fd() {
-  if (int fd = g_boot_iso_fd.exchange(-1); fd >= 0) {
-    ::close(fd);
+// Best-effort real filesystem path behind an open fd. Android SAF fds that are
+// backed by a real file (internal storage, SD card, Download raw files) expose
+// it through /proc/self/fd/<n>; genuinely path-less sources (cloud providers,
+// MediaStore streams) do not resolve to a regular file and return empty.
+static std::string realPathForFd(int fd) {
+  if (fd < 0) {
+    return {};
   }
+  char buf[4096];
+  const std::string link = fmt::format("/proc/self/fd/%d", fd);
+  const ssize_t n = ::readlink(link.c_str(), buf, sizeof(buf) - 1);
+  if (n <= 0) {
+    return {};
+  }
+  buf[n] = '\0';
+  std::string path(buf);
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(path, ec)) {
+    return {};
+  }
+  return path;
 }
 
-// Boots an ISO from a detached file descriptor (Storage Access Framework:
-// works for any DocumentsProvider, including Downloads, where no filesystem
-// path exists). Ownership of `fd` transfers to native.
+// Boots an ISO by resolving the fd to its real filesystem path and mounting it
+// path-based (load_iso(path) inside Emu::Load). This is the AetherSX2-style
+// model: real paths + all-files access, which survives an APK reinstall (SAF
+// content:// grants do not). Path-less sources are not supported. Ownership of
+// `fd` transfers to native; it is closed here since the boot uses the path.
 extern "C" int _rpcsx_bootIsoFd(int fd, std::string_view config_path_) {
-  if (fd < 0) {
-    return static_cast<int>(game_boot_result::invalid_file_or_folder);
+  const std::string path = realPathForFd(fd);
+  if (fd >= 0) {
+    ::close(fd);
   }
 
-  {
-    fs::file probe = fs::file::from_native_handle(dup(fd));
-    if (!is_iso_file_local(probe)) {
-      rpcsx_android.error("_rpcsx_bootIsoFd: ISO magic check failed (fd=%d)", fd);
-      ::close(fd);
-      return static_cast<int>(game_boot_result::invalid_file_or_folder);
-    }
+  if (path.empty() || !is_iso_file(path)) {
+    rpcsx_android.error("_rpcsx_bootIsoFd: fd %d has no real ISO path ('%s')",
+                        fd, path.c_str());
+    return static_cast<int>(game_boot_result::invalid_file_or_folder);
   }
 
   Emu.SetForceBoot(true);
 
-  close_boot_iso_fd();
-  g_boot_iso_fd = fd;
-
-  load_iso([fd] { return fs::file::from_native_handle(dup(fd)); },
-           fmt::format("saf-fd:%d", fd));
-
-  // Emulator::Load recognizes the virtual-device path as an already-mounted
-  // disc archive; per-title custom configs still apply (title id comes from
-  // the mounted PARAM.SFO).
   std::string config_path = std::string(config_path_);
   cfg_mode mode = config_path.empty() ? cfg_mode::custom : cfg_mode::custom_selection;
-  int result = static_cast<int>(Emu.BootGame(
-      iso_device::virtual_device_name + "/", "", false, mode, config_path));
-  rpcsx_android.error("_rpcsx_bootIsoFd: BootGame returned %d (fd=%d) (config=%s)", result, fd, config_path.c_str());
-
-  if (result != static_cast<int>(game_boot_result::no_errors)) {
-    // BootGame already unloaded the ISO on failure; drop our fd too.
-    close_boot_iso_fd();
-  }
-
+  int result = static_cast<int>(Emu.BootGame(path, "", false, mode, config_path));
+  rpcsx_android.error("_rpcsx_bootIsoFd: BootGame('%s') returned %d (config=%s)",
+                      path.c_str(), result, config_path.c_str());
   return result;
 }
 
@@ -2358,8 +2387,15 @@ static bool installPup(JNIEnv *env, fs::file &&pup_f, jlong progressId) {
 
   sendFirmwareInstalled(env, utils::get_firmware_version());
 
-  g_compilationQueue.push(progress,
-                          g_cfg_vfs.get_dev_flash() + "/vsh/module/vsh.self");
+  // NOTE: do NOT queue vsh.self for PPU precompilation here. That runs
+  // ppu_register_range on the compilation-queue thread, which asserts inside
+  // ensure(vm::page_protect(...)) because the PS3 vm is not initialized
+  // outside a real game boot - an uncatchable SIGTRAP that crashed the app
+  // right after an otherwise successful firmware install (PPUThread.cpp:779).
+  // The firmware is fully installed above; its modules are compiled lazily on
+  // first boot instead. Mark the progress done ourselves since the queue,
+  // which used to close it, no longer runs.
+  progress.success(0);
   return true;
 }
 
@@ -2424,12 +2460,14 @@ static bool installPkg(JNIEnv *env, fs::file &&file, jlong progressId) {
   if (worker()) {
     auto paths = std::vector(bootable_paths.begin(), bootable_paths.end());
     collectGameInfo(env, -1, paths);
-
-    for (auto &path : paths) {
-      g_compilationQueue.push(progress, std::move(path));
-    }
   }
 
+  // Installing a PKG only extracts it - do NOT precompile here. Precompiling
+  // from the compile-queue thread runs ppu_register_range without a booted vm
+  // and aborts (ensure(vm::page_protect(...))), which crashed the app right
+  // after a successful install ("installing modules"). PPU modules are built
+  // lazily on first boot, where Emu::Load sets the vm up correctly.
+  progress.success(0);
   return true;
 }
 
@@ -2544,7 +2582,9 @@ static bool installRap(JNIEnv *env, fs::file &&file, jlong progressId,
   }
 
   collectGameInfo(env, -1, {std::string(rootPath)});
-  g_compilationQueue.push(progress, std::move(ebootPath));
+  // No precompile: the module builds lazily on first boot (see installPkg).
+  (void)ebootPath;
+  progress.success(0);
   return true;
 }
 
@@ -2615,11 +2655,22 @@ static bool registerIsoArchive(JNIEnv *env, jlong progressId,
   return true;
 }
 
+static bool registerIsoByPath(JNIEnv *env, jlong progressId,
+                              const std::string &isoPath);
+
 // On-the-fly ISO support (Loader/ISO.h): nothing is extracted besides tiny
 // sidecar files for the game list UI (PARAM.SFO/ICON0.PNG/ICON1.PAM under
 // games/<TITLE_ID>/PS3_GAME/). The .iso itself is never copied; the game is
-// booted directly from its source (sourceUri) - Emu.BootGame() mounts it via
-// load_iso().
+// booted directly from its real path - Emu.BootGame() mounts it via
+// load_iso(path).
+//
+// Path-based model (AetherSX2-style: real paths + all-files access). The SAF
+// source is resolved to a real filesystem path - preferentially through the
+// fd's /proc/self/fd link, falling back to resolveTreeUriToPath - and the ISO
+// is registered by that path. A stored /storage/ path boots directly and
+// survives an APK reinstall, unlike a SAF content:// grant which is revoked.
+// Genuinely path-less sources (cloud providers, MediaStore streams) are not
+// supported: the user must place the .iso on internal/SD storage.
 static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::string_view sourceUri) {
   Progress progress(env, progressId);
 
@@ -2628,31 +2679,35 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::stri
   // closes and fdsan aborts the process.
   AtExit atExit{[&] { file.release_handle(); }};
 
-  if (file.get_handle() < 0) {
-    progress.failure("Invalid file handle");
-    return false;
-  }
+  std::string realPath = realPathForFd(file.get_handle());
 
-  // Pure fd flow (works for any DocumentsProvider, including Downloads): the
-  // archive re-opens the image on demand by dup'ing this fd - no filesystem
-  // path is ever needed. The content:// URI is stored as sourceUri and the
-  // game later boots from a fresh fd opened from it.
-  const int srcFd = file.get_handle();
-
-  {
-    fs::file dupFile = fs::file::from_native_handle(dup(srcFd));
-    if (!is_iso_file_local(dupFile)) {
-      rpcsx_android.error("installIso: ISO magic check failed (fd=%d)", srcFd);
-      progress.failure("Failed to read ISO");
-      return false;
+  if (realPath.empty()) {
+    if (std::string resolved = resolveTreeUriToPath(env, sourceUri);
+        !resolved.empty()) {
+      std::error_code ec;
+      if (std::filesystem::is_regular_file(resolved, ec)) {
+        realPath = std::move(resolved);
+      }
     }
   }
 
-  iso_archive archive(
-      [srcFd] { return fs::file::from_native_handle(dup(srcFd)); },
-      fmt::format("saf-fd:%d", srcFd));
+  if (realPath.empty()) {
+    rpcsx_android.error("installIso: no real path for source '%s'",
+                        std::string(sourceUri));
+    progress.failure("ISO must be on internal storage or an SD card. Cloud or "
+                     "Downloads-provider files have no usable path - copy the "
+                     ".iso to local storage and add it from there.");
+    return false;
+  }
 
-  return registerIsoArchive(env, progressId, archive, sourceUri, file.size());
+  rpcsx_android.notice("installIso: registering by real path '%s'", realPath);
+
+  if (!registerIsoByPath(env, progressId, realPath)) {
+    progress.failure("Failed to read ISO");
+    return false;
+  }
+
+  return true;
 }
 
 // Register an ISO located on the local filesystem by real path. Used by the
