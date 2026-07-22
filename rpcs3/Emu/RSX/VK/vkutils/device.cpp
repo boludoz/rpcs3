@@ -1133,6 +1133,12 @@ namespace vk
 		rsx_log.notice("Detected %llu MB of host coherent memory", result.host_visible_total_bytes / (0x100000));
 		rsx_log.notice("Detected %llu MB of BAR memory", result.device_bar_total_bytes / (0x100000));
 
+		if (result.device_bar_total_bytes > 0 && (result.device_bar_total_bytes >= result.device_local_total_bytes || dev.is_integrated_gpu()))
+		{
+			result.unified_memory = true;
+			rsx_log.notice("Unified memory architecture detected, %llu MB available", result.device_bar_total_bytes / (0x100000));
+		}
+
 		return result;
 	}
 
