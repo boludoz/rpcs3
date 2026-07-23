@@ -1,8 +1,29 @@
 import org.gradle.api.tasks.Copy
+import java.io.File
 
 plugins {
     id("com.android.library")
 }
+
+// Resolves a real ccache executable the same way the root CMakeLists.txt
+// does for the desktop build: prefer one already on PATH, else fall back to
+// the binary bundled at repo-root bin/ccache(.exe). Needed because this
+// machine (and likely most dev setups) has no "ccache" on PATH - passing the
+// bare command name alone, as CMAKE_C/CXX_COMPILER_LAUNCHER did before,
+// silently built without a cache.
+fun resolveCcachePath(): File? {
+    val names = listOf("ccache", "ccache.exe")
+    val pathDirs = System.getenv("PATH")?.split(File.pathSeparator).orEmpty()
+    for (dir in pathDirs) {
+        for (name in names) {
+            val candidate = File(dir, name)
+            if (candidate.isFile) return candidate
+        }
+    }
+    return names.map { rootProject.file("bin/$it") }.firstOrNull { it.isFile }
+}
+
+val ccachePath = resolveCcachePath()
 
 // Maps the sanitized Gradle flavor name (e.g. "archarmv8_4_a") back to the
 // real -march= value (e.g. "armv8.4-a") used for CMake and the final .so
@@ -26,12 +47,16 @@ android {
         }
         externalNativeBuild {
             cmake {
-                // CI passes -Prpcs3.ccache=true (with ccache on PATH) so the
-                // LLVM build is cached between workflow runs.
-                if ((project.findProperty("rpcs3.ccache") as String?)?.toBoolean() == true) {
+                // Enabled by default whenever a ccache binary can be found
+                // (PATH, or the bundled bin/ccache.exe) - the static LLVM +
+                // rpcs3 core build is heavy enough that an uncached rebuild
+                // is painful. Pass -Prpcs3.ccache=false to force a cold
+                // build (e.g. to rule out a stale-cache issue).
+                val ccacheEnabled = (project.findProperty("rpcs3.ccache") as String?)?.toBoolean() ?: true
+                if (ccacheEnabled && ccachePath != null) {
                     arguments += listOf(
-                        "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
-                        "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+                        "-DCMAKE_C_COMPILER_LAUNCHER=${ccachePath.absolutePath}",
+                        "-DCMAKE_CXX_COMPILER_LAUNCHER=${ccachePath.absolutePath}"
                     )
                 }
             }

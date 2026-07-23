@@ -627,6 +627,13 @@ struct GameInfo {
   int flags = 0;
   std::string sourceUri;
   std::string version;
+  // PARAM.SFO TITLE_ID (e.g. "BLES01253"). An update/patch PKG is always
+  // installed into the standard dev_hdd0/game/<TITLE_ID>/ directory even
+  // when the playable game itself was registered from an unrelated ISO or
+  // loose folder, so the Kotlin side can no longer assume "same path" means
+  // "same game" - it needs the real TITLE_ID to fold that report back into
+  // the existing entry instead of listing a second, often non-bootable one.
+  std::string titleId;
 };
 
 class Progress {
@@ -687,7 +694,7 @@ static void sendGameInfo(JNIEnv *env, jlong progressId,
   jmethodID gameConstructor = ensure(env->GetMethodID(
       gameClass, "<init>",
       "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/"
-      "String;Ljava/lang/String;)V"));
+      "String;Ljava/lang/String;Ljava/lang/String;)V"));
 
   std::vector<jobject> objects;
   objects.reserve(infos.size());
@@ -703,7 +710,8 @@ static void sendGameInfo(JNIEnv *env, jlong progressId,
         wrap(env, Emu.GetCallbacks().resolve_path(info.iconPath)),
         jint(info.flags),
         info.sourceUri.empty() ? nullptr : wrap(env, info.sourceUri),
-        info.version.empty() ? nullptr : wrap(env, info.version)));
+        info.version.empty() ? nullptr : wrap(env, info.version),
+        info.titleId.empty() ? nullptr : wrap(env, info.titleId)));
   }
 
   auto result = env->NewObjectArray(objects.size(), gameClass, nullptr);
@@ -966,6 +974,7 @@ fetchGameInfo(const psf::registry &psf,
       .iconPath = std::move(iconPath),
       .flags = flags,
       .version = std::move(version),
+      .titleId = std::move(titleId),
   };
 }
 
