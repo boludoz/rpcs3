@@ -855,7 +855,17 @@ static std::string findIsoInDir(const std::string &dir) {
 
 static std::optional<GameInfo>
 fetchGameInfo(const psf::registry &psf,
-              std::filesystem::path psfRootPath = {}) {
+              std::filesystem::path psfRootPath = {},
+              // Game/disc scans (collectGameInfo) and ISO registration must
+              // stay strict: a directory without a bootable EBOOT is not a
+              // playable entry. PKG install is the one caller that wants this
+              // relaxed - Sony update/patch packages commonly ship
+              // BOOTABLE=0 in their own PARAM.SFO (they only patch files into
+              // the already-installed, already-bootable game directory), so
+              // requiring it here made sendGameInfo() - and with it the
+              // GameRepository merge that refreshes name/version/sourceUri -
+              // never fire for a patch install.
+              bool requireBootable = true) {
   auto titleId = std::string(psf::get_string(psf, "TITLE_ID"));
   auto name = std::string(psf::get_string(psf, "TITLE"));
   auto bootable = psf::get_integer(psf, "BOOTABLE", 0);
@@ -865,7 +875,7 @@ fetchGameInfo(const psf::registry &psf,
     version = std::string(psf::get_string(psf, "VERSION"));
   }
 
-  if (!bootable || titleId.empty()) {
+  if ((requireBootable && !bootable) || titleId.empty()) {
     return {};
   }
 
@@ -2419,7 +2429,13 @@ static bool installPkg(JNIEnv *env, fs::file &&file, jlong progressId) {
   });
 
   for (auto &reader : readers) {
-    if (auto gameInfo = fetchGameInfo(reader.get_psf())) {
+    // requireBootable=false: an update/patch PKG's own PARAM.SFO is commonly
+    // BOOTABLE=0 (see fetchGameInfo). Its path still resolves to the
+    // already-installed game's directory (same TITLE_ID), so this reaches
+    // GameRepository.add() on the Kotlin side and refreshes the existing
+    // entry instead of leaving the "$" install placeholder stuck for the
+    // whole install and the displayed version stale.
+    if (auto gameInfo = fetchGameInfo(reader.get_psf(), {}, false)) {
       sendGameInfo(env, progressId, {{*gameInfo}});
     }
   }
