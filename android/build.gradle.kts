@@ -138,6 +138,14 @@ val pruneStaleCxxCaches = tasks.register("pruneStaleCxxCaches") {
     group = "rpcsx"
     description = "Deletes orphaned android/.cxx build trees left behind when AGP's C++ configure hash changes for a (buildType, USE_ARCH) pair already built"
 
+    // Wired via finalizedBy() from inside androidComponents.onVariants below,
+    // which captures an implicit Project reference the configuration cache
+    // can't serialize ("Cannot read field "$$implicitReceiver_Project"";
+    // see the CI failure this fixed). Opting out here just means this task's
+    // own configuration always reruns - it's cheap and only does real work
+    // (the actual pruning) at execution time anyway.
+    notCompatibleWithConfigurationCache("captures an implicit Project reference via finalizedBy() in androidComponents.onVariants")
+
     doLast {
         val cxxSourceRoot = layout.projectDirectory.dir(".cxx").asFile
         val cxxIntermediatesRoot = layout.buildDirectory.dir("intermediates/cxx").get().asFile
