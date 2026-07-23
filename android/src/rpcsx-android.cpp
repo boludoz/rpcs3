@@ -627,13 +627,17 @@ struct GameInfo {
   int flags = 0;
   std::string sourceUri;
   std::string version;
-  // PARAM.SFO TITLE_ID (e.g. "BLES01253"). An update/patch PKG is always
-  // installed into the standard dev_hdd0/game/<TITLE_ID>/ directory even
-  // when the playable game itself was registered from an unrelated ISO or
-  // loose folder, so the Kotlin side can no longer assume "same path" means
-  // "same game" - it needs the real TITLE_ID to fold that report back into
-  // the existing entry instead of listing a second, often non-bootable one.
+  // PARAM.SFO TITLE_ID (e.g. "BLES01253"). The same title can be reported
+  // from more than one source (an installed copy, a raw ISO, a loose
+  // folder) - the Kotlin side uses this, not path, as the game's real
+  // identity when deciding whether two reports are "the same game".
   std::string titleId;
+  // PARAM.SFO CATEGORY ("DG" disc game, "HG" HDD game, "GD" disc-game
+  // update, ...). Lets the app rank which source should represent a title
+  // when more than one is registered: a full installed game beats a raw
+  // ISO, which beats a bare "GD" update (not standalone-bootable on its
+  // own - an ISO boot applies it automatically from dev_hdd0/game).
+  std::string category;
 };
 
 class Progress {
@@ -691,10 +695,49 @@ static void sendGameInfo(JNIEnv *env, jlong progressId,
       gameRepositoryClass, "add", "([Lnet/rpcsx/GameInfo;J)V"));
   auto gameClass = ensure(env->FindClass("net/rpcsx/GameInfo"));
 
-  jmethodID gameConstructor = ensure(env->GetMethodID(
+  // Prefer the newest constructor (adds category), falling back through
+  // older arities detected at runtime via a non-throwing GetMethodID - so
+  // this one core binary keeps working against an app build that hasn't
+  // been rebuilt against the newest GameInfo yet (each miss above the one
+  // that matches raises a NoSuchMethodError that must be cleared before the
+  // next JNI call, or it leaks into and aborts an unrelated one).
+  jmethodID gameConstructorV4 = env->GetMethodID(
       gameClass, "<init>",
       "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/"
-      "String;Ljava/lang/String;Ljava/lang/String;)V"));
+      "String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+  if (gameConstructorV4 == nullptr) {
+    env->ExceptionClear();
+  }
+
+  jmethodID gameConstructorV3 =
+      gameConstructorV4 ? nullptr
+                        : env->GetMethodID(
+                              gameClass, "<init>",
+                              "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/"
+                              "String;Ljava/lang/String;Ljava/lang/String;)V");
+  if (gameConstructorV3 == nullptr && gameConstructorV4 == nullptr) {
+    env->ExceptionClear();
+  }
+
+  jmethodID gameConstructorV2 =
+      (gameConstructorV4 || gameConstructorV3)
+          ? nullptr
+          : env->GetMethodID(
+                gameClass, "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/"
+                "String;Ljava/lang/String;)V");
+  if (gameConstructorV2 == nullptr && gameConstructorV3 == nullptr &&
+      gameConstructorV4 == nullptr) {
+    env->ExceptionClear();
+  }
+
+  jmethodID gameConstructor =
+      (gameConstructorV4 || gameConstructorV3 || gameConstructorV2)
+          ? nullptr
+          : ensure(env->GetMethodID(
+                gameClass, "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILjava/lang/"
+                "String;)V"));
 
   std::vector<jobject> objects;
   objects.reserve(infos.size());
@@ -705,13 +748,29 @@ static void sendGameInfo(JNIEnv *env, jlong progressId,
       path.resize(path.size() - 1);
     }
 
-    objects.push_back(env->NewObject(
-        gameClass, gameConstructor, wrap(env, path), wrap(env, info.name),
-        wrap(env, Emu.GetCallbacks().resolve_path(info.iconPath)),
-        jint(info.flags),
-        info.sourceUri.empty() ? nullptr : wrap(env, info.sourceUri),
-        info.version.empty() ? nullptr : wrap(env, info.version),
-        info.titleId.empty() ? nullptr : wrap(env, info.titleId)));
+    auto iconPath = Emu.GetCallbacks().resolve_path(info.iconPath);
+    auto sourceUri = info.sourceUri.empty() ? nullptr : wrap(env, info.sourceUri);
+    auto version = info.version.empty() ? nullptr : wrap(env, info.version);
+    auto titleId = info.titleId.empty() ? nullptr : wrap(env, info.titleId);
+
+    if (gameConstructorV4) {
+      objects.push_back(env->NewObject(
+          gameClass, gameConstructorV4, wrap(env, path), wrap(env, info.name),
+          wrap(env, iconPath), jint(info.flags), sourceUri, version, titleId,
+          info.category.empty() ? nullptr : wrap(env, info.category)));
+    } else if (gameConstructorV3) {
+      objects.push_back(env->NewObject(
+          gameClass, gameConstructorV3, wrap(env, path), wrap(env, info.name),
+          wrap(env, iconPath), jint(info.flags), sourceUri, version, titleId));
+    } else if (gameConstructorV2) {
+      objects.push_back(env->NewObject(
+          gameClass, gameConstructorV2, wrap(env, path), wrap(env, info.name),
+          wrap(env, iconPath), jint(info.flags), sourceUri, version));
+    } else {
+      objects.push_back(env->NewObject(
+          gameClass, gameConstructor, wrap(env, path), wrap(env, info.name),
+          wrap(env, iconPath), jint(info.flags), sourceUri));
+    }
   }
 
   auto result = env->NewObjectArray(objects.size(), gameClass, nullptr);
@@ -863,17 +922,7 @@ static std::string findIsoInDir(const std::string &dir) {
 
 static std::optional<GameInfo>
 fetchGameInfo(const psf::registry &psf,
-              std::filesystem::path psfRootPath = {},
-              // Game/disc scans (collectGameInfo) and ISO registration must
-              // stay strict: a directory without a bootable EBOOT is not a
-              // playable entry. PKG install is the one caller that wants this
-              // relaxed - Sony update/patch packages commonly ship
-              // BOOTABLE=0 in their own PARAM.SFO (they only patch files into
-              // the already-installed, already-bootable game directory), so
-              // requiring it here made sendGameInfo() - and with it the
-              // GameRepository merge that refreshes name/version/sourceUri -
-              // never fire for a patch install.
-              bool requireBootable = true) {
+              std::filesystem::path psfRootPath = {}) {
   auto titleId = std::string(psf::get_string(psf, "TITLE_ID"));
   auto name = std::string(psf::get_string(psf, "TITLE"));
   auto bootable = psf::get_integer(psf, "BOOTABLE", 0);
@@ -883,7 +932,13 @@ fetchGameInfo(const psf::registry &psf,
     version = std::string(psf::get_string(psf, "VERSION"));
   }
 
-  if ((requireBootable && !bootable) || titleId.empty()) {
+  // An update/patch PKG's own PARAM.SFO is commonly BOOTABLE=0 (it only
+  // patches files into the already-installed, already-bootable game
+  // directory) - not a playable entry in its own right, so it's simply
+  // skipped here instead of being reported as (or merged into) a game.
+  // Whatever it changed is picked up next time the real entry - installed
+  // copy, ISO or folder - is scanned, via the version lookup below.
+  if (!bootable || titleId.empty()) {
     return {};
   }
 
@@ -968,6 +1023,24 @@ fetchGameInfo(const psf::registry &psf,
     }
   }
 
+  // Prefer an installed update's version (dev_hdd0/game/<id>/PARAM.SFO) over
+  // this entry's own disc/base version - that's the effective version the
+  // game actually runs at once a patch is installed, regardless of whether
+  // this entry itself is the installed copy, a raw ISO or a loose folder
+  // (RPCS3 applies dev_hdd0/game/<id> data to any of those at boot by
+  // TITLE_ID). For an installed HDD game this is the same file - a no-op.
+  if (!titleId.empty()) {
+    const auto updateSfoPath =
+        rpcs3::utils::get_hdd0_dir() + "game/" + titleId + "/PARAM.SFO";
+    if (fs::is_file(updateSfoPath)) {
+      auto updateSfo = psf::load_object(updateSfoPath);
+      auto updateVersion = std::string(psf::get_string(updateSfo, "APP_VER"));
+      if (!updateVersion.empty()) {
+        version = std::move(updateVersion);
+      }
+    }
+  }
+
   return GameInfo{
       .path = std::move(path),
       .name = std::move(name),
@@ -975,6 +1048,7 @@ fetchGameInfo(const psf::registry &psf,
       .flags = flags,
       .version = std::move(version),
       .titleId = std::move(titleId),
+      .category = std::string(category),
   };
 }
 
@@ -2438,13 +2512,12 @@ static bool installPkg(JNIEnv *env, fs::file &&file, jlong progressId) {
   });
 
   for (auto &reader : readers) {
-    // requireBootable=false: an update/patch PKG's own PARAM.SFO is commonly
-    // BOOTABLE=0 (see fetchGameInfo). Its path still resolves to the
-    // already-installed game's directory (same TITLE_ID), so this reaches
-    // GameRepository.add() on the Kotlin side and refreshes the existing
-    // entry instead of leaving the "$" install placeholder stuck for the
-    // whole install and the displayed version stale.
-    if (auto gameInfo = fetchGameInfo(reader.get_psf(), {}, false)) {
+    // A patch/update PKG's own PARAM.SFO is normally BOOTABLE=0, so
+    // fetchGameInfo simply returns nullopt for it here - nothing sent, no
+    // placeholder-stealing stub entry. The version bump it installs is
+    // picked up next time the real game (installed copy, ISO or folder) is
+    // scanned, via fetchGameInfo's dev_hdd0/game/<id>/PARAM.SFO lookup.
+    if (auto gameInfo = fetchGameInfo(reader.get_psf())) {
       sendGameInfo(env, progressId, {{*gameInfo}});
     }
   }
@@ -3630,6 +3703,336 @@ extern "C" bool _rpcsx_configLiveApply(std::string_view path,
   }
 
   return node->from_string(value, true);
+}
+
+// --- Per-game custom configuration ------------------------------------------
+// Mirrors desktop RPCS3's per-title configs (config/custom_configs/
+// config_<serial>.yml, cfg_mode::custom at boot - see rpcs3::utils::
+// get_custom_config_path). The serial is the game's TITLE_ID, not a
+// per-registration id: this is a storage-only bridge, the same split
+// GameConfig.kt used to keep client-side (Kotlin merges these raw overrides
+// onto the global schema from _rpcsx_configGet to render "value"/
+// "overridden") - only the storage backend moved here, so a custom config now
+// keys purely by title id and is shared by every source of the same game
+// (an installed copy, an ISO, a loose folder), matching desktop.
+
+static void ensure_custom_config_dir() {
+  fs::create_path(rpcs3::utils::get_custom_config_dir());
+}
+
+// Renders a YAML tree as JSON, scalars as JSON strings (customConfigSet/
+// Import always persist the plain-string form via json_scalar_to_string, so
+// every leaf read back is a string here too - the settings UI already reads
+// every value through optString, so this needs no further typing).
+static void yaml_to_json(const YAML::Node &node, std::string &out) {
+  if (node.IsMap()) {
+    out += '{';
+    bool first = true;
+    for (const auto &kv : node) {
+      if (!kv.first.IsScalar()) {
+        continue;
+      }
+      if (!first) {
+        out += ',';
+      }
+      first = false;
+      json_append_escaped(out, kv.first.Scalar());
+      out += ':';
+      yaml_to_json(kv.second, out);
+    }
+    out += '}';
+  } else if (node.IsScalar()) {
+    json_append_escaped(out, node.Scalar());
+  } else {
+    out += "null";
+  }
+}
+
+// Recursive leaf walker for _rpcsx_customConfigImportYaml: validates each
+// scalar leaf of `node` against `scratchRoot` (the live global schema) and
+// writes accepted ones into `outRoot`, same acceptance rule customConfigSet
+// uses. Not a local lambda so the whole file keeps its one style (plain
+// static helpers) instead of mixing in std::function.
+static void import_yaml_leaf(const YAML::Node &node, const std::string &prefix,
+                             cfg::_base *scratchRoot, YAML::Node &outRoot,
+                             bool &wroteAny) {
+  if (!node.IsMap()) {
+    return;
+  }
+
+  for (const auto &kv : node) {
+    if (!kv.first.IsScalar()) {
+      continue;
+    }
+    const std::string key = kv.first.Scalar();
+    const std::string path = prefix.empty() ? key : prefix + "@@" + key;
+
+    if (kv.second.IsMap()) {
+      import_yaml_leaf(kv.second, path, scratchRoot, outRoot, wroteAny);
+      continue;
+    }
+    if (!kv.second.IsScalar()) {
+      continue;
+    }
+
+    auto schema = find_cfg_node(scratchRoot, path);
+    if (schema == nullptr) {
+      rpcsx_android.error("customConfigImportYaml: unknown key '%s' skipped",
+                          path);
+      continue;
+    }
+
+    const std::string scalar = kv.second.Scalar();
+    if (!schema->from_string(scalar, false)) {
+      rpcsx_android.error(
+          "customConfigImportYaml: value '%s' rejected for key '%s'", scalar,
+          path);
+      continue;
+    }
+
+    auto pathList = fmt::split(path, {"@@"});
+    YAML::Node cur;
+    cur.reset(outRoot);
+    for (std::size_t i = 0; i < pathList.size(); i++) {
+      if (i + 1 == pathList.size()) {
+        cur[pathList[i]] = scalar;
+        break;
+      }
+      YAML::Node next = cur[pathList[i]];
+      if (!next.IsMap()) {
+        cur[pathList[i]] = YAML::Node(YAML::NodeType::Map);
+        next.reset(cur[pathList[i]]);
+      }
+      cur.reset(next);
+    }
+    wroteAny = true;
+  }
+}
+
+// True if a custom config file exists for this title.
+extern "C" bool _rpcsx_customConfigExists(std::string_view serial) {
+  if (serial.empty()) {
+    return false;
+  }
+  return fs::is_file(rpcs3::utils::get_custom_config_path(std::string(serial)));
+}
+
+// Deletes a title's custom config; subsequent boots fall back to the global
+// config entirely.
+extern "C" bool _rpcsx_customConfigDelete(std::string_view serial) {
+  if (serial.empty()) {
+    return false;
+  }
+  return fs::remove_file(
+      rpcs3::utils::get_custom_config_path(std::string(serial)));
+}
+
+// Raw content of the custom config file as JSON (nested map of overridden
+// leaf paths -> scalar strings), or "{}" if none exists yet. Kotlin merges
+// this onto the global schema (_rpcsx_configGet) - same split GameConfig.kt
+// used to do locally, just backed by this file instead of a uuid-keyed one.
+extern "C" std::string
+_rpcsx_customConfigGetOverrides(std::string_view serial) {
+  if (serial.empty()) {
+    return "{}";
+  }
+
+  fs::file f{rpcs3::utils::get_custom_config_path(std::string(serial))};
+  if (!f) {
+    return "{}";
+  }
+
+  YAML::Node root;
+  try {
+    root = YAML::Load(f.to_string());
+  } catch (...) {
+    return "{}";
+  }
+
+  if (!root.IsMap()) {
+    return "{}";
+  }
+
+  std::string out;
+  yaml_to_json(root, out);
+  return out;
+}
+
+// Validates and persists one leaf into the title's custom config file
+// (created on first edit). Mirrors _rpcsx_configSet's YAML tree-walk, but
+// against config/custom_configs/config_<serial>.yml instead of config.json,
+// and never live-applies (the Kotlin side already calls the existing
+// _rpcsx_configLiveApply for the currently booted game, same as before).
+extern "C" bool _rpcsx_customConfigSet(std::string_view serial,
+                                       std::string_view path,
+                                       std::string_view valueString) {
+  if (serial.empty()) {
+    return false;
+  }
+
+  // Validate against a scratch tree seeded from the live global config, so
+  // enum/range acceptance matches what boot will actually apply. Never
+  // touches g_cfg itself.
+  cfg_root scratch;
+  scratch.from_string(g_cfg.to_string());
+  auto node = find_cfg_node(&scratch, path);
+  if (node == nullptr) {
+    rpcsx_android.error("customConfigSet: node %s not found", path);
+    return false;
+  }
+
+  std::string value;
+  if (!json_scalar_to_string(valueString, value)) {
+    rpcsx_android.error("customConfigSet: node %s passed with invalid json '%s'",
+                        path, valueString);
+    return false;
+  }
+
+  if (!node->from_string(value, false)) {
+    rpcsx_android.error("customConfigSet: node %s not accepts value '%s'", path,
+                        value);
+    return false;
+  }
+
+  auto segments = fmt::split(path, {"@@"});
+  if (segments.empty()) {
+    return false;
+  }
+
+  YAML::Node root;
+  if (fs::file f{rpcs3::utils::get_custom_config_path(std::string(serial))}) {
+    try {
+      root = YAML::Load(f.to_string());
+    } catch (...) {
+      rpcsx_android.error(
+          "customConfigSet: existing custom config unreadable, recreating");
+    }
+  }
+  if (!root.IsMap()) {
+    root = YAML::Node(YAML::NodeType::Map);
+  }
+
+  YAML::Node cur = root;
+  for (std::size_t i = 0; i + 1 < segments.size(); i++) {
+    YAML::Node next = cur[segments[i]];
+    if (!next.IsMap()) {
+      cur[segments[i]] = YAML::Node(YAML::NodeType::Map);
+      next.reset(cur[segments[i]]);
+    }
+    cur.reset(next);
+  }
+  cur[segments.back()] = value;
+
+  ensure_custom_config_dir();
+  Emulator::SaveSettings(YAML::Dump(root) + "\n", std::string(serial));
+  return true;
+}
+
+// Removes one override (prunes empty parent maps). Mirrors
+// _rpcsx_configRemove, targeting the per-title custom file instead.
+extern "C" bool _rpcsx_customConfigRemove(std::string_view serial,
+                                          std::string_view path) {
+  if (serial.empty()) {
+    return false;
+  }
+  auto segments = fmt::split(path, {"@@"});
+  if (segments.empty()) {
+    return false;
+  }
+
+  fs::file f{rpcs3::utils::get_custom_config_path(std::string(serial))};
+  if (!f) {
+    return true; // nothing to remove
+  }
+
+  YAML::Node root;
+  try {
+    root = YAML::Load(f.to_string());
+  } catch (...) {
+    return true;
+  }
+  if (!root.IsMap()) {
+    return true;
+  }
+
+  std::vector<std::pair<YAML::Node, std::string>> chain;
+  YAML::Node cur = root;
+  for (std::size_t i = 0; i + 1 < segments.size(); i++) {
+    chain.emplace_back(cur, segments[i]);
+    YAML::Node next = cur[segments[i]];
+    if (!next.IsMap()) {
+      return true; // nothing to remove
+    }
+    cur.reset(next);
+  }
+  cur.remove(segments.back());
+
+  for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+    YAML::Node child = it->first[it->second];
+    if (child.IsMap() && child.size() == 0) {
+      it->first.remove(it->second);
+    }
+  }
+
+  ensure_custom_config_dir();
+  Emulator::SaveSettings(YAML::Dump(root) + "\n", std::string(serial));
+  return true;
+}
+
+// Applies a community/recommended config (sparse YAML, one key per changed
+// setting - see PerGameConfigRepository.fetchCommunityConfig) as this title's
+// custom config. Each leaf is validated against the live schema before being
+// written, same rule as customConfigSet; unmentioned settings keep
+// inheriting the user's globals at boot. Merges into any existing custom
+// file so re-applying doesn't drop prior manual edits.
+extern "C" bool _rpcsx_customConfigImportYaml(std::string_view serial,
+                                              std::string_view yaml) {
+  if (serial.empty()) {
+    return false;
+  }
+
+  YAML::Node incoming;
+  try {
+    incoming = YAML::Load(std::string(yaml));
+  } catch (...) {
+    rpcsx_android.error("customConfigImportYaml: unparseable YAML for %s",
+                        serial);
+    return false;
+  }
+  if (!incoming.IsMap()) {
+    rpcsx_android.error(
+        "customConfigImportYaml: top-level YAML is not a map for %s", serial);
+    return false;
+  }
+
+  YAML::Node root;
+  if (fs::file f{rpcs3::utils::get_custom_config_path(std::string(serial))}) {
+    try {
+      root = YAML::Load(f.to_string());
+    } catch (...) {
+      rpcsx_android.error("customConfigImportYaml: existing custom config "
+                          "unreadable, recreating");
+    }
+  }
+  if (!root.IsMap()) {
+    root = YAML::Node(YAML::NodeType::Map);
+  }
+
+  cfg_root scratch;
+  scratch.from_string(g_cfg.to_string());
+
+  bool wroteAny = false;
+  import_yaml_leaf(incoming, "", &scratch, root, wroteAny);
+
+  if (!wroteAny) {
+    rpcsx_android.error("customConfigImportYaml: no valid keys in preset for %s",
+                        serial);
+    return false;
+  }
+
+  ensure_custom_config_dir();
+  Emulator::SaveSettings(YAML::Dump(root) + "\n", std::string(serial));
+  return _rpcsx_customConfigExists(serial);
 }
 
 extern "C" std::string _rpcsx_getVersion() {
