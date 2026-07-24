@@ -398,15 +398,23 @@ error_code sys_raw_spu_load(s32 id, vm::cptr<char> path, vm::ptr<u32> entry)
 
 error_code sys_raw_spu_image_load(s32 id, vm::ptr<sys_spu_image> img)
 {
-	sysPrxForUser.warning("sys_raw_spu_image_load(id=%d, img=*0x%x)", id, img);
+    sysPrxForUser.warning("sys_raw_spu_image_load(id=%d, img=*0x%x)", id, img);
 
-	// Load SPU segments
-	img->deploy(vm::_ptr<u8>(RAW_SPU_BASE_ADDR + RAW_SPU_OFFSET * id), std::span(img->segs.get_ptr(), img->nsegs));
+    const auto thread = idm::get_unlocked<named_thread<spu_thread>>(
+        spu_thread::find_raw_spu(id));
 
-	// Use MMIO
-	vm::write32(RAW_SPU_BASE_ADDR + RAW_SPU_OFFSET * id + RAW_SPU_PROB_OFFSET + SPU_NPC_offs, img->entry_point);
+    if (!thread)
+    {
+        return CELL_ESRCH;
+    }
 
-	return CELL_OK;
+    img->deploy(thread->ls, std::span(img->segs.get_ptr(), img->nsegs));
+
+    // Setear NPC directo al thread, sin SIGSEGV
+    thread->write_reg(RAW_SPU_BASE_ADDR + RAW_SPU_OFFSET * id + RAW_SPU_PROB_OFFSET + SPU_NPC_offs,
+                      img->entry_point);
+
+    return CELL_OK;
 }
 
 error_code _sys_spu_printf_initialize(spu_printf_cb_t agcb, spu_printf_cb_t dgcb, spu_printf_cb_t atcb, spu_printf_cb_t dtcb)
