@@ -134,24 +134,20 @@ android {
 // finished actually used. Only removes directories that AGP itself manages
 // (.cxx/ and build/intermediates/cxx/), never source.
 // ---------------------------------------------------------------------------
-val pruneStaleCxxCaches = tasks.register("pruneStaleCxxCaches") {
-    group = "rpcsx"
-    description = "Deletes orphaned android/.cxx build trees left behind when AGP's C++ configure hash changes for a (buildType, USE_ARCH) pair already built"
+abstract class PruneStaleCxxCachesTask : DefaultTask() {
+    @get:Internal
+    abstract val cxxSourceRoot: DirectoryProperty
 
-    // Wired via finalizedBy() from inside androidComponents.onVariants below,
-    // which captures an implicit Project reference the configuration cache
-    // can't serialize ("Cannot read field "$$implicitReceiver_Project"";
-    // see the CI failure this fixed). Opting out here just means this task's
-    // own configuration always reruns - it's cheap and only does real work
-    // (the actual pruning) at execution time anyway.
-    notCompatibleWithConfigurationCache("captures an implicit Project reference via finalizedBy() in androidComponents.onVariants")
+    @get:Internal
+    abstract val cxxIntermediatesRoot: DirectoryProperty
 
-    doLast {
-        val cxxSourceRoot = layout.projectDirectory.dir(".cxx").asFile
-        val cxxIntermediatesRoot = layout.buildDirectory.dir("intermediates/cxx").get().asFile
+    @TaskAction
+    fun prune() {
+        val sourceRoot = cxxSourceRoot.asFile.orNull ?: return
+        val intermediatesRoot = cxxIntermediatesRoot.asFile.orNull ?: return
 
-        if (!cxxSourceRoot.isDirectory) {
-            return@doLast
+        if (!sourceRoot.isDirectory) {
+            return
         }
 
         fun archOf(hashDir: File): String? {
@@ -161,11 +157,11 @@ val pruneStaleCxxCaches = tasks.register("pruneStaleCxxCaches") {
         }
 
         fun lastActivity(buildType: String, hashDir: File): Long {
-            val logsDir = File(cxxIntermediatesRoot, "$buildType/${hashDir.name}/logs/arm64-v8a")
+            val logsDir = File(intermediatesRoot, "$buildType/${hashDir.name}/logs/arm64-v8a")
             return logsDir.listFiles()?.maxOfOrNull { it.lastModified() } ?: hashDir.lastModified()
         }
 
-        cxxSourceRoot.listFiles { f -> f.isDirectory }?.forEach { buildTypeDir ->
+        sourceRoot.listFiles { f -> f.isDirectory }?.forEach { buildTypeDir ->
             val buildType = buildTypeDir.name
             val hashDirs = buildTypeDir.listFiles { f -> f.isDirectory } ?: return@forEach
 
@@ -179,11 +175,29 @@ val pruneStaleCxxCaches = tasks.register("pruneStaleCxxCaches") {
                     group.filter { it !== newest }.forEach { (hashDir, _, _) ->
                         logger.lifecycle("Removing orphaned C++ build cache for USE_ARCH=$arch ($buildType/${hashDir.name}, superseded by ${newest.first.name})")
                         hashDir.deleteRecursively()
-                        File(cxxIntermediatesRoot, "$buildType/${hashDir.name}").deleteRecursively()
+                        File(intermediatesRoot, "$buildType/${hashDir.name}").deleteRecursively()
                     }
                 }
         }
     }
+}
+
+val pruneStaleCxxCaches = tasks.register<PruneStaleCxxCachesTask>("pruneStaleCxxCaches") {
+    group = "rpcsx"
+    description = "Deletes orphaned android/.cxx build trees left behind when AGP's C++ configure hash changes for a (buildType, USE_ARCH) pair already built"
+    cxxSourceRoot.set(layout.projectDirectory.dir(".cxx"))
+    cxxIntermediatesRoot.set(layout.buildDirectory.dir("intermediates/cxx"))
+}
+
+// ---------------------------------------------------------------------------
+// AGP's native C++ tasks (buildCMake*) track output state by fingerprinting
+// every file in output directories (soFolder). Hashing multi-GB .so files and
+// transient linker files (.tmp) causes Windows file locking errors ("Access Denied")
+// and heavy overhead. Disabling state tracking delegates incremental builds
+// strictly to CMake/Ninja.
+// ---------------------------------------------------------------------------
+tasks.matching { it.name.startsWith("buildCMake") || it.name.startsWith("externalNativeBuild") }.configureEach {
+    doNotTrackState("CMake manages its own incremental build tracking; output folder contains transient linker files")
 }
 
 // ---------------------------------------------------------------------------
