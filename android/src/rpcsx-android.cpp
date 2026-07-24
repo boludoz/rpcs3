@@ -1834,10 +1834,32 @@ static bool initVirtualPad(const std::shared_ptr<Pad> &pad) {
   return true;
 }
 
+// Sole purpose is calling the inherited PadHandlerBase::convert_stick_values
+// (deadzone/anti-deadzone/squircle math, identical to what every real
+// handler - evdev, ds4, xinput... - applies) without duplicating that math
+// here. Never bound to a device, never driven by pad_thread; stateless.
+static virtual_pad_handler g_stick_math_helper;
+
+// leftStickX/Y, rightStickX/Y arrive already rescaled by the Kotlin side to
+// PS3-native byte range (0-255, center ~128, low=up/left) via
+// `axis*127+128` - see RPCSXActivity.kt. convert_stick_values expects signed
+// input in (-255..255) with +Y meaning UP (opposite of the PS3-native
+// low=up convention), matching how every desktop handler derives its own
+// signed stick_val from up/down key combos before calling it - so X is
+// recovered with the same sign as the wire value, Y is negated going in,
+// then flipped back out (255-y_out) on the way out, exactly mirroring
+// PadHandler.cpp's own get_extended_info (255-ly / 255-ry) for every other
+// handler. Do not change one side without the other.
+static s32 toSignedAxis(int wireValue) {
+  return std::clamp((wireValue - 128) * 2, -255, 255);
+}
+
 static bool setVirtualPadData(int playerIndex, int digital1, int digital2,
                               int leftStickX, int leftStickY, int rightStickX,
-                              int rightStickY) {
-  if (playerIndex < 0 || playerIndex >= kMaxVirtualPads) {
+                              int rightStickY, int leftTrigger = -1,
+                              int rightTrigger = -1) {
+  if (playerIndex < 0 || playerIndex >= kMaxVirtualPads ||
+      playerIndex >= static_cast<int>(g_cfg_input.player.size())) {
     return false;
   }
 
@@ -1845,16 +1867,19 @@ static bool setVirtualPadData(int playerIndex, int digital1, int digital2,
     std::shared_ptr<Pad> result;
     std::lock_guard lock(g_virtual_pad_mutex);
     result = g_virtual_pads[playerIndex];
+    if (result == nullptr) {
+      result = std::make_shared<Pad>(pad_handler::null, static_cast<u32>(playerIndex), CELL_PAD_STATUS_CONNECTED, 0, CELL_PAD_DEV_TYPE_STANDARD);
+      initVirtualPad(result);
+    }
     return result;
   }();
 
-  if (pad == nullptr) {
-    return false;
-  }
+  const cfg_pad &cfg = g_cfg_input.player[playerIndex]->config;
 
   for (auto &btn : pad->m_buttons) {
     if (btn.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL1) {
       btn.m_pressed = (digital1 & btn.m_outKeyCode) != 0;
+      btn.m_value = btn.m_pressed ? 255 : 0;
 
       if (playerIndex == 0 && btn.m_outKeyCode == CELL_PAD_CTRL_PS &&
           btn.m_pressed) {
@@ -1864,24 +1889,59 @@ static bool setVirtualPadData(int playerIndex, int digital1, int digital2,
       }
 
     } else if (btn.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL2) {
-      btn.m_pressed = (digital2 & btn.m_outKeyCode) != 0;
+      // L2/R2 double as analog triggers (CELL_PAD_CAPABILITY_PRESS_MODE,
+      // see initVirtualPad). leftTrigger/rightTrigger < 0 means the caller
+      // has no analog axis for this trigger (e.g. an older APK build still
+      // calling the pre-trigger overlayPadData/multiPadData overload) -
+      // fall back to the pre-existing digital-only 0/255 behavior so that
+      // case keeps working exactly as before.
+      const bool isL2 = btn.m_outKeyCode == CELL_PAD_CTRL_L2;
+      const bool isR2 = btn.m_outKeyCode == CELL_PAD_CTRL_R2;
+      if (isL2 && leftTrigger >= 0) {
+        const u16 raw = static_cast<u16>(std::clamp(leftTrigger, 0, 255));
+        btn.m_pressed = raw > cfg.ltriggerthreshold;
+        btn.m_value = btn.m_pressed
+                          ? g_stick_math_helper.normalize_trigger(
+                                raw, cfg.ltriggerthreshold)
+                          : 0;
+      } else if (isR2 && rightTrigger >= 0) {
+        const u16 raw = static_cast<u16>(std::clamp(rightTrigger, 0, 255));
+        btn.m_pressed = raw > cfg.rtriggerthreshold;
+        btn.m_value = btn.m_pressed
+                          ? g_stick_math_helper.normalize_trigger(
+                                raw, cfg.rtriggerthreshold)
+                          : 0;
+      } else {
+        btn.m_pressed = (digital2 & btn.m_outKeyCode) != 0;
+        btn.m_value = btn.m_pressed ? 255 : 0;
+      }
     }
-
-    btn.m_value = btn.m_pressed ? 255 : 0;
   }
 
-  pad->m_sticks[0].m_value = leftStickX;
-  pad->m_sticks[1].m_value = leftStickY;
-  pad->m_sticks[2].m_value = rightStickX;
-  pad->m_sticks[3].m_value = rightStickY;
+  u16 lx, ly, rx, ry;
+  g_stick_math_helper.convert_stick_values(
+      lx, ly, toSignedAxis(leftStickX), -toSignedAxis(leftStickY),
+      cfg.lstickdeadzone, cfg.lstick_anti_deadzone, cfg.lpadsquircling);
+  g_stick_math_helper.convert_stick_values(
+      rx, ry, toSignedAxis(rightStickX), -toSignedAxis(rightStickY),
+      cfg.rstickdeadzone, cfg.rstick_anti_deadzone, cfg.rpadsquircling);
+
+  pad->m_sticks[0].m_value = lx;
+  pad->m_sticks[1].m_value = 255 - ly;
+  pad->m_sticks[2].m_value = rx;
+  pad->m_sticks[3].m_value = 255 - ry;
   return true;
 }
 
+// leftTrigger/rightTrigger are analog L2/R2 axis values (0-255), or -1 if
+// the caller has none to offer (see setVirtualPadData's own fallback note).
 extern "C" bool _rpcsx_overlayPadData(int digital1, int digital2,
                                       int leftStickX, int leftStickY,
-                                      int rightStickX, int rightStickY) {
+                                      int rightStickX, int rightStickY,
+                                      int leftTrigger, int rightTrigger) {
   return setVirtualPadData(0, digital1, digital2, leftStickX, leftStickY,
-                           rightStickX, rightStickY);
+                           rightStickX, rightStickY, leftTrigger,
+                           rightTrigger);
 }
 
 // Extended version of _rpcsx_overlayPadData that targets one of up to
@@ -1889,9 +1949,11 @@ extern "C" bool _rpcsx_overlayPadData(int digital1, int digital2,
 // detected on the Android side can each drive a distinct PS3 pad.
 extern "C" bool _rpcsx_multiPadData(int playerIndex, int digital1, int digital2,
                                     int leftStickX, int leftStickY,
-                                    int rightStickX, int rightStickY) {
+                                    int rightStickX, int rightStickY,
+                                    int leftTrigger, int rightTrigger) {
   return setVirtualPadData(playerIndex, digital1, digital2, leftStickX,
-                           leftStickY, rightStickX, rightStickY);
+                           leftStickY, rightStickX, rightStickY, leftTrigger,
+                           rightTrigger);
 }
 
 extern "C" int _rpcsx_getMaxVirtualPads() { return kMaxVirtualPads; }
@@ -1901,6 +1963,36 @@ extern "C" int _rpcsx_getMaxVirtualPads() { return kMaxVirtualPads; }
 // of its own, so it polls this and drives the physical controller / phone
 // vibrator. Returns (large << 8) | small, each 0-255; 0 when idle or no pad.
 extern "C" int _rpcsx_getPadVibration(int playerIndex) {
+  if (playerIndex < 0 || playerIndex >= kMaxVirtualPads ||
+      playerIndex >= static_cast<int>(g_cfg_input.player.size())) {
+    return 0;
+  }
+
+  std::shared_ptr<Pad> pad;
+  {
+    std::lock_guard lock(g_virtual_pad_mutex);
+    pad = g_virtual_pads[playerIndex];
+  }
+
+  if (pad == nullptr) {
+    return 0;
+  }
+
+  // Same call every real handler makes right before writing to hardware
+  // (e.g. ds4_pad_handler::apply_pad_data) - applies multiplier_vibration_
+  // motor_large/_small, switch_vibration_motors and vibration_threshold from
+  // cfg_pad instead of forwarding the game's raw motor values untouched.
+  const cfg_pad &cfg = g_cfg_input.player[playerIndex]->config;
+  const int large = cfg.get_large_motor_speed(pad->m_vibrate_motors);
+  const int small = cfg.get_small_motor_speed(pad->m_vibrate_motors);
+  return ((large & 0xff) << 8) | (small & 0xff);
+}
+
+// Read-only poll of a virtual pad's current (already deadzone/squircle-
+// processed, see setVirtualPadData) stick values, for a live UI preview -
+// e.g. the pad tuning screen's stick-position canvas. Packs all 4 axes (each
+// 0-255, PS3-native convention) into one int: (lx<<24)|(ly<<16)|(rx<<8)|ry.
+extern "C" int _rpcsx_getStickPosition(int playerIndex) {
   if (playerIndex < 0 || playerIndex >= kMaxVirtualPads) {
     return 0;
   }
@@ -1915,9 +2007,11 @@ extern "C" int _rpcsx_getPadVibration(int playerIndex) {
     return 0;
   }
 
-  const int large = pad->m_vibrate_motors[0].value;
-  const int small = pad->m_vibrate_motors[1].value;
-  return ((large & 0xff) << 8) | (small & 0xff);
+  const int lx = pad->m_sticks[0].m_value & 0xff;
+  const int ly = pad->m_sticks[1].m_value & 0xff;
+  const int rx = pad->m_sticks[2].m_value & 0xff;
+  const int ry = pad->m_sticks[3].m_value & 0xff;
+  return (lx << 24) | (ly << 16) | (rx << 8) | ry;
 }
 
 // Name of the first Vulkan physical device, or empty if Vulkan is unusable.
@@ -2084,16 +2178,17 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
   Emu.Init();
 
   static_assert(kMaxVirtualPads == 4);
-  g_cfg_input.player1.handler.set(pad_handler::virtual_pad);
-  g_cfg_input.player1.device.from_string("Virtual");
-  g_cfg_input.player2.handler.set(pad_handler::virtual_pad);
-  g_cfg_input.player2.device.from_string("Virtual");
-  g_cfg_input.player3.handler.set(pad_handler::virtual_pad);
-  g_cfg_input.player3.device.from_string("Virtual");
-  g_cfg_input.player4.handler.set(pad_handler::virtual_pad);
-  g_cfg_input.player4.device.from_string("Virtual");
-
-  g_cfg_input.save("", g_cfg_input_configs.default_config);
+  if (!g_cfg_input.load("", g_cfg_input_configs.default_config)) {
+    g_cfg_input.player1.handler.set(pad_handler::virtual_pad);
+    g_cfg_input.player1.device.from_string("Virtual");
+    g_cfg_input.player2.handler.set(pad_handler::virtual_pad);
+    g_cfg_input.player2.device.from_string("Virtual");
+    g_cfg_input.player3.handler.set(pad_handler::virtual_pad);
+    g_cfg_input.player3.device.from_string("Virtual");
+    g_cfg_input.player4.handler.set(pad_handler::virtual_pad);
+    g_cfg_input.player4.device.from_string("Virtual");
+    g_cfg_input.save("", g_cfg_input_configs.default_config);
+  }
 
   g_cfg.core.llvm_cpu.from_string("oryon-1");
   g_cfg.core.llvm_threads.from_string("1");
@@ -3703,6 +3798,90 @@ extern "C" bool _rpcsx_configLiveApply(std::string_view path,
   }
 
   return node->from_string(value, true);
+}
+
+// --- Pad tuning configuration ------------------------------------------
+// Per-player-slot bridge onto g_cfg_input.player[i]->config (a cfg_pad) -
+// the same per-player pad config desktop RPCS3's Qt pad dialog reads/writes
+// (rpcs3qt/pad_settings_dialog.cpp). Global scope only, no per-game override
+// (cfg_pad isn't a per-game concept upstream either). setVirtualPadData
+// reads these fields live off this same tree on every input event, so a
+// write here takes effect on the very next event - no pad::reset needed,
+// unlike a handler/device change.
+static cfg_pad *pad_tuning_cfg(int playerIndex) {
+  if (playerIndex < 0 ||
+      playerIndex >= static_cast<int>(g_cfg_input.player.size())) {
+    return nullptr;
+  }
+  return &g_cfg_input.player[playerIndex]->config;
+}
+
+// Schema for one leaf/subtree of a player's pad config, same shape
+// _rpcsx_configGet produces (type/value/default/min/max/variants). No JSON
+// overlay file exists for pad config (unlike config.json) - the live tree
+// already is what gets persisted, so effective_value() reads straight off
+// it (null overlay).
+extern "C" std::string _rpcsx_padConfigGet(int playerIndex,
+                                            std::string_view path) {
+  auto *cfg = pad_tuning_cfg(playerIndex);
+  if (cfg == nullptr) {
+    return {};
+  }
+
+  auto node = find_cfg_node(cfg, path);
+  if (node == nullptr) {
+    return {};
+  }
+
+  std::string result;
+  cfg_to_json(node, YAML::Node(YAML::NodeType::Null), result);
+  return result;
+}
+
+extern "C" bool _rpcsx_padConfigSet(int playerIndex, std::string_view path,
+                                     std::string_view valueString) {
+  auto *cfg = pad_tuning_cfg(playerIndex);
+  if (cfg == nullptr) {
+    return false;
+  }
+
+  auto node = find_cfg_node(cfg, path);
+  if (node == nullptr) {
+    rpcsx_android.error("padConfigSet: node %s not found for player %d", path,
+                        playerIndex);
+    return false;
+  }
+
+  std::string value;
+  if (!json_scalar_to_string(valueString, value)) {
+    rpcsx_android.error("padConfigSet: node %s passed with invalid json '%s'",
+                        path, valueString);
+    return false;
+  }
+
+  if (!node->from_string(value, !Emu.IsStopped())) {
+    return false;
+  }
+
+  g_cfg_input.save("", g_cfg_input_configs.default_config);
+  return true;
+}
+
+extern "C" bool _rpcsx_padConfigResetToDefault(int playerIndex,
+                                                std::string_view path) {
+  auto *cfg = pad_tuning_cfg(playerIndex);
+  if (cfg == nullptr) {
+    return false;
+  }
+
+  auto node = find_cfg_node(cfg, path);
+  if (node == nullptr) {
+    return false;
+  }
+
+  node->from_default();
+  g_cfg_input.save("", g_cfg_input_configs.default_config);
+  return true;
 }
 
 // --- Per-game custom configuration ------------------------------------------

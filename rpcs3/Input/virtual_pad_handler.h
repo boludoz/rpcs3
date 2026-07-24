@@ -37,4 +37,9 @@ public:
 
 	bool bindPadToDevice(std::shared_ptr<Pad> pad) override;
 	void process() override {}
+
+	// Exposes the protected PadHandlerBase trigger curve to the Android JNI
+	// bridge (rpcsx-android.cpp), which drives pad state directly and has no
+	// PadHandlerBase subclass of its own to call it from.
+	u16 normalize_trigger(u16 value, u32 threshold) const { return NormalizeTriggerInput(value, threshold); }
 };

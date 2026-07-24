@@ -131,7 +131,7 @@ struct cfg_pad final : cfg::node
 
 	cfg::uint<0, 255> colorR{ this, "Color Value R", 0 };
 	cfg::uint<0, 255> colorG{ this, "Color Value G", 0 };
-	cfg::uint<0, 255> colorB{ this, "Color Value B", 0 };
+	cfg::uint<0, 255> colorB{ this, "Color Value B", 255 };
 
 	cfg::_bool led_low_battery_blink{ this, "Blink LED when battery is below 20%", true };
 	cfg::_bool led_battery_indicator{ this, "Use LED as a battery indicator", false };
