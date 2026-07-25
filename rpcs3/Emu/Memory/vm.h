@@ -10,6 +10,12 @@
 
 class ppu_thread;
 
+#if defined(ARCH_ARM64)
+constexpr u32 RAW_SPU_MMIO_BASE = 0xE0000000;
+u32  ppu_read_mmio_aware_u32(u8* vm_base, u32 addr);
+void ppu_write_mmio_aware_u32(u8* vm_base, u32 addr, u32 value);
+#endif
+
 #ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
 #include "rpcs3qt/breakpoint_handler.h"
 #include "util/logs.hpp"
@@ -324,6 +330,19 @@ namespace vm
 		{
 			using dest_t = std::conditional_t<std::is_void_v<T>, U, T>;
 
+// TODO: Wait for #19078
+#if defined(ARCH_ARM64)
+			// RawSPU MMIO, dest_t is already BE so just reinterpret the bits
+			if constexpr (sizeof(dest_t) == 4)
+			{
+				if (addr >= RAW_SPU_MMIO_BASE) [[unlikely]]
+				{
+					ppu_write_mmio_aware_u32(g_base_addr, addr, std::bit_cast<u32>(static_cast<dest_t>(value)));
+					return;
+				}
+			}
+#endif
+
 			if constexpr (!std::is_void_v<T>)
 			{
 				*_ptr<dest_t>(addr) = value;
@@ -344,8 +363,19 @@ namespace vm
 			write<be_t<u16>>(addr, value, ppu);
 		}
 
+// TODO: Wait for #19078
+#if defined(ARCH_ARM64)
+		inline u32 read32(u32 addr)
+#else
 		inline const be_t<u32>& read32(u32 addr)
+#endif
 		{
+#if defined(ARCH_ARM64)
+			if (addr >= RAW_SPU_MMIO_BASE) [[unlikely]]
+			{
+				return std::bit_cast<be_t<u32>>(ppu_read_mmio_aware_u32(g_base_addr, addr));
+			}
+#endif
 			return _ref<u32>(addr);
 		}
 
