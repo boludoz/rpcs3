@@ -10,6 +10,7 @@
 
 class ppu_thread;
 
+// TODO: Wait for #19078
 #if defined(ARCH_ARM64)
 constexpr u32 RAW_SPU_MMIO_BASE = 0xE0000000;
 u32  ppu_read_mmio_aware_u32(u8* vm_base, u32 addr);
