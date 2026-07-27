@@ -3119,17 +3119,36 @@ static std::string resolveTreeUriToPath(JNIEnv *env, std::string_view uri) {
   // 3. Check for com.android.providers.downloads.documents
   if (uri.find("com.android.providers.downloads.documents") != std::string_view::npos) {
     const std::string downloadsDir = getDownloadsDirectoryPath(env);
-    if (fullDecoded.find("downloads") != std::string::npos) {
-      std::size_t docPos = fullDecoded.find("/document/");
-      if (docPos != std::string::npos) {
-        std::string sub = fullDecoded.substr(docPos + 10);
-        if (sub.rfind("raw:", 0) == 0) sub = sub.substr(4);
-        if (sub.rfind("/storage/", 0) == 0) return sub;
-        if (!sub.empty() && sub != "downloads") {
-          return downloadsDir + "/" + sub;
+    std::size_t docPos = fullDecoded.find("/document/");
+    if (docPos != std::string::npos) {
+      std::string sub = fullDecoded.substr(docPos + 10);
+      auto queryPos = sub.find_first_of("?#");
+      if (queryPos != std::string::npos) sub.resize(queryPos);
+
+      if (sub.rfind("raw:", 0) == 0) sub = sub.substr(4);
+      if (sub.rfind("/storage/", 0) == 0) return sub;
+
+      std::error_code ec;
+      if (!sub.empty() && sub != "downloads") {
+        std::string candidate = downloadsDir + "/" + sub;
+        if (std::filesystem::exists(candidate, ec)) {
+          return candidate;
         }
       }
-      return downloadsDir;
+    }
+    return downloadsDir;
+  }
+
+  // 4. Check for com.android.providers.media.documents
+  if (uri.find("com.android.providers.media.documents") != std::string_view::npos) {
+    std::size_t docPos = fullDecoded.find("/document/");
+    if (docPos != std::string::npos) {
+      std::string sub = fullDecoded.substr(docPos + 10);
+      auto queryPos = sub.find_first_of("?#");
+      if (queryPos != std::string::npos) sub.resize(queryPos);
+
+      if (sub.rfind("raw:", 0) == 0) sub = sub.substr(4);
+      if (sub.rfind("/storage/", 0) == 0) return sub;
     }
   }
 
