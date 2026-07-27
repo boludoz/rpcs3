@@ -1494,7 +1494,7 @@ void put_a64_reg_value(ucontext_t* context, u32 reg_index, u32 reg_size, bool re
 		ensure(false);
 	}
 
-	auto make_mask = [](u32 bytes)
+	auto make_mask = [](u32 bytes) -> u64
 	{
 		if (bytes == 8)
 		{
@@ -1526,7 +1526,7 @@ u64 get_a64_reg_value(ucontext_t* context, u32 reg_index, u32 reg_size)
 		return 0;
 	}
 
-	auto make_mask = [](u32 bytes)
+	auto make_mask = [](u32 bytes) -> u64
 	{
 		if (bytes == 8)
 		{
@@ -1899,7 +1899,7 @@ bool handle_access_violation(u32 addr, bool is_writing, bool is_exec, ucontext_t
 			}
 			else if (mem_size == 2)
 			{
-				value = std::bit_cast<be_t<u16>>(value);
+				value = std::bit_cast<be_t<u16>>(static_cast<u16>(value));
 			}
 			else
 			{
