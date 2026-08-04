@@ -442,6 +442,9 @@ namespace utils
 		if (!codec)
 			return default_sample_format;
 
+		std::set<AVSampleFormat> formats;
+
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
 		const void* sample_formats = nullptr;
 		int num = 0;
 
@@ -455,12 +458,22 @@ namespace utils
 			return default_sample_format;
 
 		int i = 0;
-		std::set<AVSampleFormat> formats;
 		for (const AVSampleFormat* sample_format = static_cast<const AVSampleFormat*>(sample_formats); sample_format && *sample_format != AV_SAMPLE_FMT_NONE && i < num; sample_format++, i++)
 		{
 			media_log.notice("select_sample_format: found sample format: '%s'", av_get_sample_fmt_name(*sample_format));
 			formats.insert(*sample_format);
 		}
+#else
+		// ffmpeg < 7.1: avcodec_get_supported_config doesn't exist yet
+		if (!codec->sample_fmts)
+			return default_sample_format;
+
+		for (const AVSampleFormat* sample_format = codec->sample_fmts; sample_format && *sample_format != AV_SAMPLE_FMT_NONE; sample_format++)
+		{
+			media_log.notice("select_sample_format: found sample format: '%s'", av_get_sample_fmt_name(*sample_format));
+			formats.insert(*sample_format);
+		}
+#endif
 
 		if (formats.contains(AV_SAMPLE_FMT_FLT)) return AV_SAMPLE_FMT_FLT;
 		if (formats.contains(AV_SAMPLE_FMT_FLTP)) return AV_SAMPLE_FMT_FLTP;

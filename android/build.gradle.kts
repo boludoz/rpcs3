@@ -222,9 +222,12 @@ androidComponents {
                     include("**/librpcsx-android.so")
                 }
             } else {
-                dependsOn("externalNativeBuild${variantNameCap}")
-                from(layout.buildDirectory.dir("intermediates/cxx")) {
-                    include("**/obj/arm64-v8a/librpcsx-android.so")
+                // intermediates/cxx is keyed by AGP's configure hash, not by
+                // variant, so every flavor built so far matches there and they
+                // all collapse onto the same renamed output. merged_native_libs
+                // is variant-scoped, so it yields exactly this flavor's .so.
+                dependsOn("merge${variantNameCap}NativeLibs")
+                from(layout.buildDirectory.dir("intermediates/merged_native_libs/${variant.name}")) {
                     include("**/arm64-v8a/librpcsx-android.so")
                 }
             }

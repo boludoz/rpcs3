@@ -4232,9 +4232,4 @@ extern "C" jint JNI_GetCreatedJavaVMs(JavaVM **vmBuf, jsize bufLen, jsize *nVMs)
   return 0; // JNI_OK
 }
 
-// Dummy implementation to satisfy curl linkage on Android
-extern "C" int wolfSSL_CTX_set1_groups_list(void* ctx, const char* list) {
-  return 1; // 1 = success
-}
-
 #pragma GCC diagnostic pop
