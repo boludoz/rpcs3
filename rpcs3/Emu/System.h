@@ -171,6 +171,15 @@ class Emulator final
 	// 2. It signifies that we don't want to exit on Kill(), for example if we want to transition to another application.
 	bool m_force_boot = false;
 
+	// Set in Load() when the booted path is a PSX disc image, so the argv for
+	// ps1_emu is built after the category has been resolved rather than before.
+	bool m_psx_disc_boot = false;
+
+	// PS1 TargetID chosen from the disc serial; picks the BIOS region letter.
+	// Shared between the argv handed to ps1_emu and the region patch, which have
+	// to agree or the patch silently wins.
+	u8 m_psx_target_id = 0x82;
+
 	bool m_continuous_mode = false;
 	bool m_has_gui = true;
 	bool m_headless = false;

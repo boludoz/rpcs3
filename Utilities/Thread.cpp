@@ -1297,12 +1297,31 @@ a64_mem_info_t decode_a64_mem_inst(u32 inst)
 		return r;
 	}
 
-	// Scalar load/store immediate, unsigned offset variants only:
+	// Scalar load/store:
 	// size[31:30]
 	// V[26]
 	// opc[23:22]
-	// class bits[29:24] = 111001
-	if ((inst & 0x3B000000) == 0x39000000)
+	//
+	// Three addressing modes are accepted, because size/opc fully describe all
+	// of them and the faulting address comes from the signal anyway - what the
+	// caller needs is only the value register and its width, not how the
+	// address was formed:
+	//   unsigned immediate  bits[29:24] = 111001
+	//   unscaled immediate  bits[29:24] = 111000, bit21 = 0, bits[11:10] = 00
+	//   register offset     bits[29:24] = 111000, bit21 = 1, bits[11:10] = 10
+	//
+	// LLVM emits the register-offset form for RawSPU MMIO on AArch64 (e.g.
+	// "STR W9, [X10, X8]" while ps1_emu loads its SPU images), and only the
+	// unsigned-immediate form used to be decoded - so those accesses were
+	// reported as segfaults instead of being emulated.
+	//
+	// Deliberately excluded: the pre/post-indexed forms (bits[11:10] = 01/11),
+	// which write back to Rn, and the LSE atomics (bit21 = 1, bits[11:10] =
+	// 00), which are read-modify-write. Neither can be emulated as a plain
+	// access, so they must keep falling through as unsupported.
+	if ((inst & 0x3B000000) == 0x39000000 ||
+		(inst & 0x3B200C00) == 0x38000000 ||
+		(inst & 0x3B200C00) == 0x38200800)
 	{
 		const u32 size = (inst >> 30) & 3;
 		const u32 opc  = (inst >> 22) & 3;

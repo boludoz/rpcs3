@@ -643,8 +643,22 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 #endif
 			rsx_log.warning("vkAcquireNextImageKHR failed with error code %lld. Flip request ignored until surface is recreated.", static_cast<s64>(status));
 			swapchain_unavailable = true;
-			reinitialize_swapchain();
-			ensure(m_current_frame, "Could not reinitialize swapchain after surface loss signal!");
+
+			// reinitialize_swapchain() clears m_current_frame as the first step
+			// of tearing the old context down, and leaves it null when it then
+			// bails out - which it legitimately does while shutting down, or
+			// when the window is gone and the swapchain cannot be rebuilt.
+			// Ignoring the result and asserting on m_current_frame turned that
+			// ordinary shutdown into a fatal abort ("Could not reinitialize
+			// swapchain after surface loss signal!" from the Emulation Join
+			// thread). There is nothing to acquire in that state and retrying
+			// only spins on a dead swapchain, so drop the frame instead.
+			if (!reinitialize_swapchain())
+			{
+				rsx_log.warning("Swapchain could not be rebuilt; dropping this flip until a surface returns.");
+				return;
+			}
+
 			continue;
 		default:
 			vk::die_with_error(status);

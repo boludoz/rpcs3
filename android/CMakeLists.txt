@@ -130,7 +130,15 @@ set(USE_VULKAN on)
 set(WITH_LLVM on)
 set(BUILD_LLVM on)
 set(STATIC_LINK_LLVM on)
-set(USE_LTO on)
+# ThinLTO defers most codegen to link time, which on this project means the
+# whole statically linked LLVM gets optimized on every link - the bulk of a
+# ~14 minute Debug turnaround, for optimizations a Debug build then throws
+# away. Keep it for Release, where the runtime win is the point.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(USE_LTO off)
+else()
+    set(USE_LTO on)
+endif()
 set(USE_PRECOMPILED_HEADERS off)
 set(USE_NATIVE_INSTRUCTIONS off)
 set(USE_GAMEMODE off)

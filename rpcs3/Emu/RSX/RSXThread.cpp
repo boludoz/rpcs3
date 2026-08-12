@@ -2543,6 +2543,41 @@ namespace rsx
 		{
 			performance_counters.sampled_frames++;
 
+			// Diagnostic: a display buffer whose contents never change means the
+			// guest is presenting a framebuffer nobody wrote - which from the
+			// outside is indistinguishable from a healthy 60fps flip loop, and
+			// shows up only as a black screen. Sampled every ~2s so it costs
+			// nothing; logged at error level so it needs no log config to appear.
+			if ((performance_counters.sampled_frames % 120) == 0)
+			{
+				const auto& db = display_buffers[info.buffer];
+				const u32 addr = rsx::get_address(db.offset, CELL_GCM_LOCATION_LOCAL);
+				const u32 bytes = std::min<u32>(db.pitch * db.height, 0x100000);
+
+				if (addr && bytes && vm::check_addr(addr, vm::page_readable, bytes))
+				{
+					const u8* px = vm::get_super_ptr<u8>(addr);
+					u64 sum = 0;
+					u32 nonzero = 0;
+
+					// Every 64th byte is plenty to tell "all zeroes" from "a
+					// picture" without walking 3.5 MB on the RSX thread.
+					for (u32 i = 0; i < bytes; i += 64)
+					{
+						sum += px[i];
+						nonzero += px[i] != 0;
+					}
+
+					rsx_log.error("FLIP DIAG: buf=%d offset=0x%x addr=0x%x %dx%d pitch=%d sum=%d nonzero=%d/%d",
+						info.buffer, db.offset, addr, db.width, db.height, db.pitch, sum, nonzero, bytes / 64);
+				}
+				else
+				{
+					rsx_log.error("FLIP DIAG: buf=%d offset=0x%x addr=0x%x unreadable (%dx%d pitch=%d)",
+						info.buffer, db.offset, addr, db.width, db.height, db.pitch);
+				}
+			}
+
 			if (m_pause_after_x_flips && m_pause_after_x_flips-- == 1)
 			{
 				Emu.Pause();

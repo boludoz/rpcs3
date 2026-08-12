@@ -108,33 +108,44 @@ error_code console_write(ppu_thread& ppu, vm::ptr<char> data, u32 len)
 	return CELL_OK;
 }
 
-error_code cellGamePs1Emu_61CE2BCD()
+// The PS1 emulator's own system interface. On hardware these live in
+// libsysutil_game_ps1emu.sprx / libsysutil_sysconf_ps1emu.sprx and talk to the
+// VSH over cellSysutilPacket*, so there is nothing behind them here.
+//
+// ps1_emu calls all five of them three times each while booting a disc, and
+// acts on what they return - 0x6A12D11F in particular is a state transition
+// whose failure makes the emulator roll the change back. Returning CELL_OK
+// with no output at least keeps that path succeeding, but the arguments are
+// logged because what the emulator asks for is the only way to learn what it
+// expects: 0x83E79A23 takes an id it validates against 6, plus an output
+// pointer it fills from the reply.
+error_code cellGamePs1Emu_61CE2BCD(u32 a1, u32 a2, u32 a3, u32 a4)
 {
-	UNIMPLEMENTED_FUNC(sysPrxForUser);
+	sysPrxForUser.todo("cellGamePs1Emu_61CE2BCD(0x%x, 0x%x, 0x%x, 0x%x)", a1, a2, a3, a4);
 	return CELL_OK;
 }
 
-error_code cellSysconfPs1emu_639ABBDE()
+error_code cellSysconfPs1emu_639ABBDE(u32 a1, u32 a2, u32 a3, u32 a4)
 {
-	UNIMPLEMENTED_FUNC(sysPrxForUser);
+	sysPrxForUser.todo("cellSysconfPs1emu_639ABBDE(0x%x, 0x%x, 0x%x, 0x%x)", a1, a2, a3, a4);
 	return CELL_OK;
 }
 
-error_code cellSysconfPs1emu_6A12D11F()
+error_code cellSysconfPs1emu_6A12D11F(u32 a1, u32 a2, u32 a3, u32 a4)
 {
-	UNIMPLEMENTED_FUNC(sysPrxForUser);
+	sysPrxForUser.todo("cellSysconfPs1emu_6A12D11F(0x%x, 0x%x, 0x%x, 0x%x)", a1, a2, a3, a4);
 	return CELL_OK;
 }
 
-error_code cellSysconfPs1emu_83E79A23()
+error_code cellSysconfPs1emu_83E79A23(u32 id, vm::ptr<void> out, u32 a3, u32 a4)
 {
-	UNIMPLEMENTED_FUNC(sysPrxForUser);
+	sysPrxForUser.todo("cellSysconfPs1emu_83E79A23(id=%d, out=*0x%x, 0x%x, 0x%x)", id, out, a3, a4);
 	return CELL_OK;
 }
 
-error_code cellSysconfPs1emu_EFDDAF6C()
+error_code cellSysconfPs1emu_EFDDAF6C(u32 a1, u32 a2, u32 a3, u32 a4)
 {
-	UNIMPLEMENTED_FUNC(sysPrxForUser);
+	sysPrxForUser.todo("cellSysconfPs1emu_EFDDAF6C(0x%x, 0x%x, 0x%x, 0x%x)", a1, a2, a3, a4);
 	return CELL_OK;
 }
 

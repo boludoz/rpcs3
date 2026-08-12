@@ -37,6 +37,7 @@
 #include "Loader/ISO.h"
 #include "Loader/ELF.h"
 #include "Loader/disc.h"
+#include "Loader/PSXDisc.h"
 
 #include "rpcs3_version.h"
 
@@ -968,6 +969,81 @@ bool Emulator::BootRsxCapture(const std::string& path)
 	return true;
 }
 
+// ps1_emu refuses to boot a disc whose region it does not accept, and there is
+// no argument that turns that off - CFW solves it by rewriting one instruction
+// inside the emulator, and so do we. The value 0x82 lands in the 0x80-0x82
+// range the check treats as "no region restriction".
+//
+// The location is found by signature rather than by a fixed address, the same
+// way ManaGunZ's OffsetFinder does it, so this keeps working across firmware
+// versions instead of needing a table:
+//
+//   60 00 00 00   nop
+//   81 22 81 F0   lwz   r9, -0x7E10(r2)
+//   7C 7D 07 B4   extsw r29, r3          <- replaced with li r29, 0x82
+//   80 62 81 F4   lwz   r3, -0x7E0C(r2)
+// PS1 BIOS region selector. psdevwiki documents the table inside the emulator as
+// "JJJJAEJEAEJJEJJA", indexed by TargetID - 0x80, and the letter it picks is
+// patched into the BIOS version string. So the TargetID is not a "bypass" value
+// at all - it chooses the region outright, and 0x82 (index 2) is Japan.
+//
+// Cobra hardcodes 0x82, which silently forces every disc to NTSC-J; psdevwiki
+// calls that out as a bug and prescribes deriving it from the third character of
+// the disc's serial instead, which is what this does.
+static u8 psx_target_id_for_serial(const std::string& serial)
+{
+	switch (serial.size() > 2 ? serial[2] : '\0')
+	{
+	case 'U': case 'u': return 0x84; // index 4 -> 'A', NTSC-U/C
+	case 'E': case 'e': return 0x85; // index 5 -> 'E', PAL
+	default: return 0x82;            // index 2 -> 'J', and the safe default
+	}
+}
+
+static void patch_ps1_emu_region_check(u8 target_id)
+{
+	static constexpr u8 signature[] =
+	{
+		0x60, 0x00, 0x00, 0x00,
+		0x81, 0x22, 0x81, 0xF0,
+		0x7C, 0x7D, 0x07, 0xB4,
+		0x80, 0x62, 0x81, 0xF4,
+	};
+
+	// li r29, target_id == addi r29, 0, target_id
+	const u32 replacement = 0x3BA00000 | target_id;
+
+	// The emulator's text lives in the main segment, loaded at 0x10000. Scan a
+	// generous window rather than assuming its size.
+	constexpr u32 scan_start = 0x10000;
+	constexpr u32 scan_end = 0x400000;
+
+	for (u32 addr = scan_start; addr + sizeof(signature) < scan_end; addr += 4)
+	{
+		if (!vm::check_addr(addr, vm::page_readable, sizeof(signature)))
+		{
+			continue;
+		}
+
+		if (std::memcmp(vm::get_super_ptr<u8>(addr), signature, sizeof(signature)) != 0)
+		{
+			continue;
+		}
+
+		// get_super_ptr already yields a big-endian view, so a plain store
+		// writes the instruction in guest byte order.
+		const u32 target = addr + 8;
+		*vm::get_super_ptr<u32>(target) = replacement;
+
+		sys_log.success("ps1_emu: region patched at 0x%x (li r29, 0x%x -> BIOS region '%c')", target, target_id,
+			target_id == 0x84 ? 'A' : target_id == 0x85 ? 'E' : 'J');
+		return;
+	}
+
+	sys_log.error("ps1_emu: region check signature not found - the disc may be rejected. "
+		"This firmware's ps1_emu may differ from the one the signature was taken from.");
+}
+
 game_boot_result Emulator::GetElfPathFromDir(std::string& elf_path, const std::string& path)
 {
 	if (!fs::is_dir(path))
@@ -1573,6 +1649,26 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		}
 
 		const std::string resolved_path = GetCallbacks().resolve_path(m_path);
+
+		// A PSX disc image is not a PS3 disc and nothing on it is executable by
+		// the PS3: ps1_emu reads the disc through sys_storage, so the image is
+		// mounted as the optical drive and the firmware emulator is booted
+		// instead. Checked before the PS3 ISO branch below because a 2048-byte
+		// PSX image also carries a CD001 descriptor and would be taken for a
+		// PS3 disc otherwise.
+		m_psx_disc_boot = false;
+
+		if (!launching_from_disc_archive && !m_path.starts_with(iso_device::virtual_device_name) && psx::is_psx_image(resolved_path))
+		{
+			if (!psx::mount(resolved_path))
+			{
+				sys_log.error("Failed to mount PSX disc image '%s'", resolved_path);
+				return game_boot_result::invalid_file_or_folder;
+			}
+
+			m_psx_disc_boot = true;
+		}
+
 		// A path into the virtual ISO device means the caller already mounted
 		// the image via load_iso() (path-less sources such as Android SAF file
 		// descriptors) - treat it as a disc archive boot without re-mounting.
@@ -2396,6 +2492,54 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 		std::replace(m_title.begin(), m_title.end(), '\n', ' ');
 		std::replace(m_localized_title.begin(), m_localized_title.end(), '\n', ' ');
 
+		if (m_psx_disc_boot)
+		{
+			// ps1_emu takes 7 arguments and has no game path among them - it
+			// finds the game on the mounted disc, which is the whole
+			// difference from netemu/newemu (9 args, reading an installed
+			// folder).
+			//
+			// argv[1]/argv[2] are bare file names. psdevwiki documents them as
+			// full paths for this emulator and as names only for the other
+			// two, but the emulator itself proved otherwise: given a full path
+			// it printed "/dev_hdd0/savedata/vmc//dev_hdd0/savedata/vmc/
+			// PSXDISC_mc1.VM1" and failed to open the cards, so it prepends
+			// the directory exactly like netemu/newemu do.
+			sys_log.notice("PSX disc boot: %s", psx::mounted()->path());
+
+			m_cat = "1P"; // makes the loader below use vfs::get(argv[0])
+			m_title = m_path.substr(m_path.find_last_of(fs::delim) + 1);
+
+			const std::string mc1 = "PSXDISC_mc1.VM1";
+			const std::string mc2 = "PSXDISC_mc2.VM1";
+
+			argv.resize(7);
+			argv[0] = "/dev_flash/ps1emu/ps1_emu.self";
+			argv[1] = mc1;
+			argv[2] = mc2;
+			// Region/TargetID, chosen from the disc's own serial rather than
+			// hardcoded: 0x82 is not a "bypass", it is index 2 of the emulator's
+			// region table and means Japan. An earlier attempt to change this to
+			// 0x84 "made no difference" only because the region patch below was
+			// overwriting it with 0x82 regardless - both have to agree.
+			m_psx_target_id = psx_target_id_for_serial(psx::mounted()->boot_serial());
+			argv[3] = fmt::format("%04X", m_psx_target_id);
+			argv[4] = "1200";
+			argv[5] = "1"; // upconvert
+			argv[6] = "0"; // smoothing
+
+			// Same as the 1P path does: hand the emulator two blank 128KB
+			// cards and let the games format them. The files themselves still
+			// live under the full path - only argv carries the bare name.
+			for (const std::string& card : {mc1, mc2})
+			{
+				if (fs::file f(vfs::get("/dev_hdd0/savedata/vmc/" + card), fs::write + fs::create); f)
+				{
+					f.trunc(128 * 1024);
+				}
+			}
+		}
+
 		// Open SELF or ELF
 		std::string elf_path = m_path;
 
@@ -2631,6 +2775,11 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 
 			if (ppu_load_exec(ppu_exec, false, m_path, DeserialManager()))
 			{
+				if (m_psx_disc_boot)
+				{
+					patch_ps1_emu_region_check(m_psx_target_id);
+				}
+
 				if (g_cfg.core.ppu_debug && had_been_decrypted)
 				{
 					// Auto-dump decrypted binaries if PPU debug is enabled
@@ -3368,6 +3517,10 @@ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_s
 	{
 		return std::shared_ptr<std::remove_pointer_t<decltype(ptr)>>(ptr);
 	};
+
+	// Eject the disc, so a stale image cannot be served to whatever boots next.
+	psx::unmount();
+	m_psx_disc_boot = false;
 
 	if (!IsStopped() && savestate)
 	{

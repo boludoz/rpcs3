@@ -861,9 +861,25 @@ error_code cellSysutilPacketEnd()
 	return CELL_OK;
 }
 
-error_code cellSysutilGameDataAssignVmc()
+// game_plugin job 97 ("vmcAssign"), which assigns a PS1 virtual memory card to
+// one of the two emulated ports before ps1_emu is started. psdevwiki documents
+// it as taking four arguments; declaring it with none meant BIND_FUNC never
+// unmarshalled r3-r6, so the port, the filename and the completion callback
+// were all silently dropped and the caller got CELL_OK for an assignment that
+// never happened.
+error_code cellSysutilGameDataAssignVmc(u32 vmc_port, vm::cptr<char> vmc_file_name, vm::ptr<void> callback, u32 zero)
 {
-	cellSysutil.todo("cellSysutilGameDataAssignVmc()");
+	cellSysutil.todo("cellSysutilGameDataAssignVmc(vmc_port=%d, vmc_file_name=%s, callback=*0x%x, zero=%d)", vmc_port, vmc_file_name, callback, zero);
+
+	// Ports are 0 and 1 - the PS1 has exactly two memory card slots.
+	if (vmc_port > 1 || !vmc_file_name)
+	{
+		return CELL_GAMEDATA_ERROR_PARAM;
+	}
+
+	// The callback is still not invoked: its signature is not documented and
+	// calling it with the wrong one would be worse than not calling it. Anything
+	// that waits on it will still wait - but the arguments now at least arrive.
 	return CELL_OK;
 }
 

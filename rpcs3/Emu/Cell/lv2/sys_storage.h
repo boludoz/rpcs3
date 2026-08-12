@@ -33,6 +33,10 @@ struct lv2_storage
 	const u64 mode;
 	const u64 flags;
 
+	// Event queue this handle wants medium events (insert/eject) delivered to,
+	// registered through sys_storage_configure_medium_event.
+	atomic_t<u32> medium_event_queue{0};
+
 	lv2_storage(u64 device_id, fs::file&& file, u64 mode, u64 flags)
 		: device_id(device_id)
 		, file(std::move(file))
@@ -71,6 +75,12 @@ error_code sys_storage_get_device_info(u64 device, vm::ptr<StorageDeviceInfo> bu
 error_code sys_storage_get_device_config(vm::ptr<u32> storages, vm::ptr<u32> devices);
 error_code sys_storage_report_devices(u32 storages, u32 start, u32 devices, vm::ptr<u64> device_ids);
 error_code sys_storage_configure_medium_event(u32 fd, u32 equeue_id, u32 c);
+
+// Delivers the medium-insert sequence to every handle that asked for medium
+// events on the optical drive. Mounting an image is not enough on its own:
+// hardware only reacts once the drive reports an insertion, which is why CFW
+// fakes exactly these two events after mounting.
+void sys_storage_send_medium_insert_event();
 error_code sys_storage_set_medium_polling_interval();
 error_code sys_storage_create_region();
 error_code sys_storage_delete_region();

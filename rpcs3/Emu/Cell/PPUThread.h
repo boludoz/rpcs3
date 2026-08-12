@@ -318,6 +318,11 @@ public:
 	u64 exec_bytes = 0; // Amount of "bytes" executed (4 for each instruction)
 
 	u32 dbg_step_pc = 0;
+
+	// Diagnostic only: counts sys_ppu_thread_yield calls so a spinning thread
+	// can be told apart from one that merely yields often. Not serialised.
+	u64 dbg_yield_count = 0;
+
 	atomic_t<ppu_debugger_mode> debugger_mode{};
 
 	struct call_history_t

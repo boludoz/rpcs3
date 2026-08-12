@@ -8,6 +8,8 @@
 
 #include "util/asm.hpp"
 
+#include <set>
+
 LOG_CHANNEL(sys_semaphore);
 
 lv2_sema::lv2_sema(utils::serial& ar)
@@ -236,8 +238,11 @@ error_code sys_semaphore_trywait(ppu_thread& ppu, u32 sem_id)
 
 	sys_semaphore.trace("sys_semaphore_trywait(sem_id=0x%x)", sem_id);
 
+	s32 observed = 0;
+
 	const auto sem = idm::check<lv2_obj, lv2_sema>(sem_id, [&](lv2_sema& sema)
 	{
+		observed = sema.val;
 		return sema.val.try_dec(0);
 	});
 
@@ -248,6 +253,18 @@ error_code sys_semaphore_trywait(ppu_thread& ppu, u32 sem_id)
 
 	if (!sem.ret)
 	{
+		// Diagnostic: a thread that trywaits the same semaphore hundreds of
+		// thousands of times is waiting for a post that is not coming. Naming the
+		// semaphore is the whole point - it can then be matched against which
+		// ids actually get posted below.
+		static atomic_t<u64> fails{0};
+
+		if (const u64 count = ++fails; count % 100000 == 0)
+		{
+			sys_semaphore.error("SEMA STARVED: '%s' trywait sem_id=0x%x val=%d failed %d times",
+				ppu.get_name(), sem_id, observed, count);
+		}
+
 		return not_an_error(CELL_EBUSY);
 	}
 
@@ -259,6 +276,25 @@ error_code sys_semaphore_post(ppu_thread& ppu, u32 sem_id, s32 count)
 	ppu.state += cpu_flag::wait;
 
 	sys_semaphore.trace("sys_semaphore_post(sem_id=0x%x, count=%d)", sem_id, count);
+
+	// Diagnostic: the first post to each semaphore, so the set of ids that ever
+	// get signalled can be compared against the one a thread is starving on.
+	// Bounded so a busy game cannot flood the log.
+	{
+		static shared_mutex seen_mutex;
+		static std::set<u32> seen_ids;
+
+		bool first = false;
+		{
+			std::lock_guard lock(seen_mutex);
+			first = seen_ids.size() < 64 && seen_ids.insert(sem_id).second;
+		}
+
+		if (first)
+		{
+			sys_semaphore.error("SEMA POST: first post to sem_id=0x%x by '%s'", sem_id, ppu.get_name());
+		}
+	}
 
 	const auto sem = idm::get<lv2_obj, lv2_sema>(sem_id, [&](lv2_sema& sema)
 	{

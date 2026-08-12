@@ -167,6 +167,18 @@ s32 sys_ppu_thread_yield(ppu_thread& ppu)
 
 	sys_ppu_thread.trace("sys_ppu_thread_yield()");
 
+	// A thread that yields hundreds of thousands of times without making
+	// progress is spinning, and the only thing that identifies what it is
+	// spinning on is where it is doing it from. cia is the syscall site, lr the
+	// caller - enough to find the loop in a disassembly. Logged at error level
+	// so it needs no log config, and only every 100k yields so a healthy game
+	// (which yields constantly) prints roughly nothing.
+	if (const u64 count = ++ppu.dbg_yield_count; count % 100000 == 0)
+	{
+		sys_ppu_thread.error("YIELD SPIN: thread '%s' id=0x%x yields=%d cia=0x%x lr=0x%x",
+			ppu.get_name(), ppu.id, count, ppu.cia, ppu.lr);
+	}
+
 	const s32 success = lv2_obj::yield(ppu) ? CELL_OK : CELL_CANCEL;
 
 	if (success == CELL_CANCEL)

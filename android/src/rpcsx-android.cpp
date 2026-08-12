@@ -35,6 +35,7 @@
 #include "Input/pad_thread.h"
 #include "Input/virtual_pad_handler.h"
 #include "Loader/ISO.h"
+#include "Loader/PSXDisc.h"
 #include "Loader/PSF.h"
 #include "Loader/PUP.h"
 #include "Loader/TAR.h"
@@ -306,6 +307,7 @@ enum class FileType {
   Edat,
   Rap,
   Iso,
+  Psx,
 };
 
 static bool is_iso_file_local(const fs::file& file) {
@@ -315,6 +317,27 @@ static bool is_iso_file_local(const fs::file& file) {
   char magic[5];
   file.read_at(32768ULL + 1, magic, 5);
   return magic[0] == 'C' && magic[1] == 'D' && magic[2] == '0' && magic[3] == '0' && magic[4] == '1';
+}
+
+// A cue sheet is text naming other files, so the signature scan used for disc
+// images cannot see it. Recognizing it by content keeps the single-file picker
+// consistent with the folder scan - registerPsxByPath resolves the .bin from
+// the sheet afterwards.
+static bool looks_like_cue_sheet(const fs::file &file) {
+  if (file.size() < 16 || file.size() > 1024 * 1024) {
+    return false;
+  }
+
+  std::string head(std::min<u64>(file.size(), 4096), '\0');
+
+  if (file.read_at(0, head.data(), head.size()) != head.size()) {
+    return false;
+  }
+
+  const std::string upper = fmt::to_upper(head);
+  return upper.find("TRACK") != std::string::npos &&
+         (upper.find("FILE") != std::string::npos ||
+          upper.find("INDEX") != std::string::npos);
 }
 
 static FileType getFileType(const fs::file &file) {
@@ -343,9 +366,22 @@ static FileType getFileType(const fs::file &file) {
     return FileType::Rap;
   }
 
+  // After the magic-number checks, so a small binary that happens to contain
+  // these words cannot be mistaken for a sheet.
+  if (looks_like_cue_sheet(file)) {
+    return FileType::Psx;
+  }
+
   // Check ISO header directly on duplicated handle to avoid procfs SELinux restrictions
   if (file.get_handle() >= 0) {
     fs::file dupFile = fs::file::from_native_handle(dup(file.get_handle()));
+
+    // PSX first: a 2048-byte PS1 image also carries a CD001 descriptor, so
+    // is_iso_file_local would claim it as a PS3 disc.
+    if (psx::is_psx_image(dupFile)) {
+      return FileType::Psx;
+    }
+
     if (is_iso_file_local(dupFile)) {
       return FileType::Iso;
     }
@@ -2848,6 +2884,51 @@ static bool registerIsoArchive(JNIEnv *env, jlong progressId,
   return true;
 }
 
+// PS1 disc images carry no PARAM.SFO, so there is no TITLE_ID or icon to
+// harvest - the file name is all the identity there is. The image is never
+// copied: the stored path is what Emu::Load mounts through psx::mount, so the
+// entry survives as long as the file stays put.
+static bool registerPsxByPath(JNIEnv *env, jlong progressId,
+                              const std::string &discPath) {
+  if (!psx::is_psx_image(discPath)) {
+    return false;
+  }
+
+  // A .cue and its .bin both sit in the folder; registering both would list
+  // the same game twice. The cue wins because it carries the track layout,
+  // and a bare .bin is only registered when no cue references it.
+  std::filesystem::path path(discPath);
+  const std::string ext = fmt::to_upper(path.extension().string());
+
+  if (ext != ".CUE") {
+    std::error_code ec;
+    for (const auto &sibling : std::filesystem::directory_iterator(path.parent_path(), ec)) {
+      if (fmt::to_upper(sibling.path().extension().string()) != ".CUE") {
+        continue;
+      }
+
+      if (fs::file cue{sibling.path().string()};
+          cue && cue.to_string().find(path.filename().string()) != std::string::npos) {
+        rpcsx_android.notice("registerPsxByPath: skipping '%s', covered by '%s'",
+                             discPath, sibling.path().string());
+        return false;
+      }
+    }
+  }
+
+  GameInfo info{};
+  info.path = discPath;
+  info.name = path.stem().string();
+  info.sourceUri = discPath;
+  // No PARAM.SFO category exists for a PS1 disc; "1P" is what the PS3 itself
+  // uses for PS1 titles, so the app ranks these alongside PS1 Classics.
+  info.category = "1P";
+
+  rpcsx_android.notice("registerPsxByPath: registering '%s'", discPath);
+  sendGameInfo(env, progressId, {{info}});
+  return true;
+}
+
 static bool registerIsoByPath(JNIEnv *env, jlong progressId,
                               const std::string &isoPath);
 
@@ -2903,6 +2984,47 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId, std::stri
   return true;
 }
 
+// Same path-based model as installIso, and for a stronger reason: a PS1 disc
+// is mounted by psx::mount, which for a .cue has to open the .bin the sheet
+// names. A SAF fd grants access to one document, never to its siblings, so a
+// real filesystem path is not an optimization here - it is the only thing that
+// can work.
+static bool installPsx(JNIEnv *env, fs::file &&file, jlong progressId,
+                       std::string_view sourceUri) {
+  Progress progress(env, progressId);
+
+  AtExit atExit{[&] { file.release_handle(); }};
+
+  std::string realPath = realPathForFd(file.get_handle());
+
+  if (realPath.empty()) {
+    if (std::string resolved = resolveTreeUriToPath(env, sourceUri);
+        !resolved.empty()) {
+      std::error_code ec;
+      if (std::filesystem::is_regular_file(resolved, ec)) {
+        realPath = std::move(resolved);
+      }
+    }
+  }
+
+  if (realPath.empty()) {
+    rpcsx_android.error("installPsx: no real path for source '%s'",
+                        std::string(sourceUri));
+    progress.failure("PS1 discs must be on internal storage or an SD card, "
+                     "and a .cue needs its .bin next to it. Copy the game to "
+                     "local storage and add it from there.");
+    return false;
+  }
+
+  if (!registerPsxByPath(env, progressId, realPath)) {
+    progress.failure("Failed to read PS1 disc image");
+    return false;
+  }
+
+  progress.success(1);
+  return true;
+}
+
 // Register an ISO located on the local filesystem by real path. Used by the
 // "Add ISO directory" folder-scan flow so the game boots directly from the
 // user-chosen file (no sourceUri fallback, no copying).
@@ -2933,6 +3055,7 @@ static void collectIsoInfo(JNIEnv *env, jlong progressId,
                            const std::string &rootDir) {
   std::error_code ec;
   std::vector<std::string> isoPaths;
+  std::vector<std::string> psxPaths;
 
   if (std::filesystem::is_regular_file(rootDir, ec)) {
     // Allow a single .iso file to be passed directly.
@@ -2957,23 +3080,47 @@ static void collectIsoInfo(JNIEnv *env, jlong progressId,
                        [](unsigned char c) { return std::tolower(c); });
         if (ext == ".iso") {
           isoPaths.push_back(entry.path().string());
+        } else if (ext == ".cue" || ext == ".bin" || ext == ".img") {
+          psxPaths.push_back(entry.path().string());
         }
       }
     }
   }
 
-  rpcsx_android.notice("collectIsoInfo: found %zu iso file(s) under '%s'",
-                       isoPaths.size(), rootDir);
+  // A .iso can be either a PS3 disc or a PS1 one; is_psx_image looks at the
+  // volume descriptor, so move the PS1 ones over instead of failing later in
+  // registerIsoByPath with a missing PARAM.SFO.
+  for (auto it = isoPaths.begin(); it != isoPaths.end();) {
+    if (psx::is_psx_image(*it)) {
+      psxPaths.push_back(std::move(*it));
+      it = isoPaths.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  rpcsx_android.notice(
+      "collectIsoInfo: found %zu iso file(s) and %zu ps1 disc(s) under '%s'",
+      isoPaths.size(), psxPaths.size(), rootDir);
+
+  const std::size_t total = isoPaths.size() + psxPaths.size();
 
   Progress progress(env, progressId);
-  progress.report(0, isoPaths.size());
+  progress.report(0, total);
 
   std::size_t processed = 0;
   for (const auto &iso : isoPaths) {
     if (!registerIsoByPath(env, /*progressId=*/-1, iso)) {
       rpcsx_android.error("collectIsoInfo: failed to register '%s'", iso);
     }
-    progress.report(++processed, isoPaths.size());
+    progress.report(++processed, total);
+  }
+
+  for (const auto &psxDisc : psxPaths) {
+    // A bare .bin covered by a sibling .cue returns false on purpose, so this
+    // is not logged as a failure.
+    registerPsxByPath(env, /*progressId=*/-1, psxDisc);
+    progress.report(++processed, total);
   }
 
   progress.success(processed);
@@ -3126,10 +3273,26 @@ static std::string resolveTreeUriToPath(JNIEnv *env, std::string_view uri) {
         if (sub.rfind("raw:", 0) == 0) sub = sub.substr(4);
         if (sub.rfind("/storage/", 0) == 0) return sub;
         if (!sub.empty() && sub != "downloads") {
-          return downloadsDir + "/" + sub;
+          // A file picked out of Downloads usually has a MediaStore document
+          // id here ("msf:1000000042"), not a name, so this join produces a
+          // path that does not exist. Only hand it back if it really resolves
+          // - otherwise the caller must fall back to the fd (or, on the
+          // Kotlin side, to a display-name lookup).
+          std::string candidate = downloadsDir + "/" + sub;
+          std::error_code ec;
+          if (std::filesystem::exists(candidate, ec)) {
+            return candidate;
+          }
         }
       }
-      return downloadsDir;
+
+      // Only a tree URI means "the Downloads folder itself". Answering with
+      // the directory for a /document/ URI hands a directory back to callers
+      // that asked to resolve a single file; PrecompilerService then opens it
+      // and the native read aborts with EISDIR.
+      if (uri.find("/tree/") != std::string_view::npos) {
+        return downloadsDir;
+      }
     }
   }
 
@@ -3277,6 +3440,9 @@ extern "C" bool _rpcsx_install(JNIEnv *env, int fd, long progressId, std::string
 
   case FileType::Iso:
     return installIso(env, std::move(file), progressId, sourceUri);
+
+  case FileType::Psx:
+    return installPsx(env, std::move(file), progressId, sourceUri);
 
   case FileType::Rap:
     Progress(env, progressId)
